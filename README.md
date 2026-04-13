@@ -247,3 +247,5 @@ Purpose:
 - If you change the deletion criteria, generate a new manifest.
 
 For the step-by-step commands, use `RUNBOOK.md`.
+
+🤖 Created with Codex.
