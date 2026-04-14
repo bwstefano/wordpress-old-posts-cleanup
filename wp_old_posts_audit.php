@@ -7,6 +7,62 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit( 1 );
 }
 
+if ( ! function_exists( 'old_posts_manual_include_ids_from_file' ) ) {
+	function old_posts_manual_include_ids_from_file( $path ) {
+		if ( '' === $path ) {
+			return array();
+		}
+
+		if ( ! file_exists( $path ) ) {
+			old_posts_fail( 'Manual include file not found.', array( 'path' => $path ) );
+		}
+
+		$lines = file( $path, FILE_IGNORE_NEW_LINES );
+		if ( false === $lines ) {
+			old_posts_fail( 'Could not read the manual include file.', array( 'path' => $path ) );
+		}
+
+		$ids = array();
+		foreach ( $lines as $line ) {
+			$line = trim( (string) $line );
+			if ( '' === $line || 0 === strpos( $line, '#' ) ) {
+				continue;
+			}
+
+			if ( ! ctype_digit( $line ) ) {
+				old_posts_fail(
+					'Manual include file contains a non-numeric post ID.',
+					array(
+						'path'  => $path,
+						'value' => $line,
+					)
+				);
+			}
+
+			$ids[] = (int) $line;
+		}
+
+		$ids = array_values( array_unique( array_filter( array_map( 'intval', $ids ) ) ) );
+		sort( $ids );
+
+		return $ids;
+	}
+}
+
+if ( ! function_exists( 'old_posts_manual_include_ids' ) ) {
+	function old_posts_manual_include_ids( $cli_args ) {
+		$ids = array_map( 'intval', old_posts_csv_arg( $cli_args['include-post-ids'] ?? null ) );
+		$ids = array_merge(
+			$ids,
+			old_posts_manual_include_ids_from_file( isset( $cli_args['include-post-ids-file'] ) ? (string) $cli_args['include-post-ids-file'] : '' )
+		);
+		$ids = array_values( array_unique( array_filter( $ids ) ) );
+		sort( $ids );
+
+		return $ids;
+	}
+}
+
 $cli_args = old_posts_collect_runtime_args(
 	isset( $args ) && is_array( $args ) ? $args : array(),
 	isset( $GLOBALS['argv'] ) && is_array( $GLOBALS['argv'] ) ? $GLOBALS['argv'] : array()
@@ -21,6 +77,9 @@ $batch_size    = isset( $cli_args['batch-size'] ) ? max( 10, (int) $cli_args['ba
 $usage_scan    = old_posts_bool_arg( isset( $cli_args['scan-usage'] ) ? $cli_args['scan-usage'] : null, true );
 $max_posts     = isset( $cli_args['max-posts'] ) ? max( 1, (int) $cli_args['max-posts'] ) : 0;
 $progress_cfg  = old_posts_progress_config( $cli_args, $batch_size, 30 );
+$manual_include_post_ids = old_posts_manual_include_ids( $cli_args );
+$manual_include_post_map = array_fill_keys( $manual_include_post_ids, true );
+$manual_include_matched_ids = array();
 
 if ( empty( $statuses ) ) {
 	old_posts_fail( 'Provide at least one post status in statuses=...' );
@@ -69,6 +128,8 @@ old_posts_log(
 			'statuses'   => $statuses,
 			'batch_size' => $batch_size,
 			'max_posts'  => $max_posts,
+			'include_post_ids' => $manual_include_post_ids,
+			'include_post_ids_file' => isset( $cli_args['include-post-ids-file'] ) ? (string) $cli_args['include-post-ids-file'] : '',
 			'progress_every' => $progress_cfg['every'],
 			'progress_seconds' => $progress_cfg['seconds'],
 		),
@@ -129,8 +190,13 @@ while ( true ) {
 		);
 
 		$plain_text_length = old_posts_plain_text_length( $post->post_content );
-		if ( $plain_text_length > $char_limit ) {
+		$manual_include    = isset( $manual_include_post_map[ (int) $post->ID ] );
+		if ( $plain_text_length > $char_limit && ! $manual_include ) {
 			continue;
+		}
+
+		if ( $manual_include ) {
+			$manual_include_matched_ids[ (int) $post->ID ] = true;
 		}
 
 		$featured_media = (int) get_post_thumbnail_id( $post->ID );
@@ -217,6 +283,8 @@ while ( true ) {
 			'post_title'         => get_the_title( $post->ID ),
 			'permalink'          => $permalink,
 			'plain_text_length'  => $plain_text_length,
+			'selection_reason'   => ( $manual_include && $plain_text_length > $char_limit ) ? 'manual_include' : 'char_limit',
+			'manual_include_requested' => $manual_include,
 			'featured_media'     => $featured_media,
 			'attachment_ids'     => $attachment_ids,
 			'wpml'               => $wpml_context,
@@ -476,6 +544,11 @@ foreach ( $attachment_records as $attachment_record ) {
 	}
 }
 
+$manual_include_matched_ids = array_values( array_map( 'intval', array_keys( $manual_include_matched_ids ) ) );
+sort( $manual_include_matched_ids );
+$manual_include_unmatched_ids = array_values( array_map( 'intval', array_diff( $manual_include_post_ids, $manual_include_matched_ids ) ) );
+sort( $manual_include_unmatched_ids );
+
 ksort( $candidate_by_language );
 ksort( $candidate_by_year );
 ksort( $candidate_by_status );
@@ -496,6 +569,8 @@ $manifest = array(
 		'usage_scan'      => $usage_scan,
 		'batch_size'      => $batch_size,
 		'max_posts'       => $max_posts,
+		'include_post_ids' => $manual_include_post_ids,
+		'include_post_ids_file' => isset( $cli_args['include-post-ids-file'] ) ? (string) $cli_args['include-post-ids-file'] : '',
 		'redirect_policy' => array(
 			'recommended_default' => 410,
 			'not_recommended'     => '301-home',
@@ -508,6 +583,9 @@ $manifest = array(
 		'candidate_attachments'        => count( $attachment_records ),
 		'safe_attachment_delete_count' => $safe_attachment_count,
 		'redirect_exportable_posts'    => $redirect_exportable_posts,
+		'manual_include_requested_count' => count( $manual_include_post_ids ),
+		'manual_include_matched_count' => count( $manual_include_matched_ids ),
+		'manual_include_unmatched_ids' => $manual_include_unmatched_ids,
 		'by_language'                  => $candidate_by_language,
 		'by_year'                      => $candidate_by_year,
 		'by_status'                    => $candidate_by_status,

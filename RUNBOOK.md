@@ -53,6 +53,9 @@ Important: commands that redirect output to paths like `>"$OLD_POSTS_OUTPUT_DIR/
 ```bash
 export MANIFEST_PATH="$OLD_POSTS_OUTPUT_DIR/manifest.json"
 export REDIRECTS_PATH="$OLD_POSTS_OUTPUT_DIR/redirects.csv"
+export REMAINING_POSTS_REPORT="$OLD_POSTS_OUTPUT_DIR/remaining-posts-$YEAR.json"
+export REMAINING_POSTS_CSV="$OLD_POSTS_OUTPUT_DIR/remaining-posts-$YEAR.csv"
+export MANUAL_INCLUDE_POSTS="$OLD_POSTS_OUTPUT_DIR/manual-include-$YEAR.txt"
 export YEAR="2014"
 export YEAR_LIST="2011 2012 2013 2014"
 export TRASH_LOG="$OLD_POSTS_OUTPUT_DIR/trash-posts-$YEAR.jsonl"
@@ -183,6 +186,61 @@ Validation checklist:
 - The target year is present in the log.
 - The admin UI shows the posts in the trash.
 - Frontend spot checks still behave as expected.
+
+### Optional: review the posts that remained in the same year
+
+Use this when you want a review queue of posts that were not trashed by the current manifest, so you can decide which ones should also be removed before attachment cleanup starts.
+
+Use `year="$YEAR"` for a single year or swap it for `year-list="$YEAR_LIST"` when you want one combined report for all active years in the current run.
+
+```bash
+nohup sh -c '
+./run_wp_old_posts.sh eval-file wp_old_posts_remaining_posts.php \
+  manifest="$MANIFEST_PATH" \
+  year="$YEAR" \
+  output="$REMAINING_POSTS_REPORT" \
+  csv-output="$REMAINING_POSTS_CSV" \
+  batch-size="$OLD_POSTS_AUDIT_BATCH_SIZE" \
+  progress-every="$OLD_POSTS_PROGRESS_EVERY" \
+  progress-seconds="$OLD_POSTS_PROGRESS_SECONDS"
+' >"$OLD_POSTS_OUTPUT_DIR/remaining-posts-$YEAR.out" 2>&1 &
+```
+
+What the report tells you:
+
+- `review_reason=not_in_manifest_over_char_limit`: the post stayed out because it exceeded the current character limit
+- `review_reason=eligible_now_but_missing_from_manifest`: the post currently fits the cutoff but is not present in the manifest; regenerate the manifest before doing more destructive work
+- `review_reason=manifest_candidate_still_live`: the post is already in the manifest but is still live; check the `trash-posts` log for why it was skipped
+- `review_reason=manifest_candidate_changed_since_manifest`: the post changed after the manifest was generated; regenerate the manifest before continuing
+
+The CSV is usually the easiest file to review manually. When you approve extra posts for deletion, create `"$MANUAL_INCLUDE_POSTS"` with one post ID per line:
+
+```text
+# manual include for YEAR=2014
+123
+456
+789
+```
+
+Then regenerate the manifest with those approved IDs included:
+
+```bash
+nohup sh -c '
+./run_wp_old_posts.sh eval-file wp_old_posts_audit.php \
+  output="$MANIFEST_PATH" \
+  before="$OLD_POSTS_BEFORE" \
+  limit="$OLD_POSTS_CHARACTER_LIMIT" \
+  post-type="$OLD_POSTS_POST_TYPE" \
+  statuses="$OLD_POSTS_STATUSES" \
+  batch-size="$OLD_POSTS_AUDIT_BATCH_SIZE" \
+  scan-usage=1 \
+  include-post-ids-file="$MANUAL_INCLUDE_POSTS" \
+  progress-every="$OLD_POSTS_PROGRESS_EVERY" \
+  progress-seconds="$OLD_POSTS_PROGRESS_SECONDS"
+' >"$OLD_POSTS_OUTPUT_DIR/audit-manual-include-$YEAR.out" 2>&1 &
+```
+
+After the manifest is rebuilt, rerun `trash-posts` for the same year. Already trashed posts will be skipped, and the newly approved posts will enter the normal attachment-deletion flow in the next steps.
 
 ## 8. Delete attachments
 

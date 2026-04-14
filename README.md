@@ -18,11 +18,12 @@ At a high level, the workflow is:
 1. Audit the site and generate a manifest of deletion candidates.
 2. Export redirects for public posts if needed.
 3. Move posts to the trash year by year.
-4. Delete only attachments that are considered safe.
-5. Audit leftovers on disk and build a reviewed deletion list.
-6. Delete approved leftovers from disk.
-7. Force-delete the posts after validation.
-8. Optionally verify and repair WPML translation consistency.
+4. Optionally report the posts that remained in the same years and manually approve extra post IDs.
+5. Delete only attachments that are considered safe.
+6. Audit leftovers on disk and build a reviewed deletion list.
+7. Delete approved leftovers from disk.
+8. Force-delete the posts after validation.
+9. Optionally verify and repair WPML translation consistency.
 
 ## Safety model
 
@@ -45,6 +46,8 @@ The scripts are designed around guardrails instead of raw speed:
   Builds the manifest of candidate posts and candidate attachments.
 - `wp_old_posts_execute.php`
   Runs the main phases: `export-redirects`, `trash-posts`, `delete-attachments`, and `force-delete-posts`.
+- `wp_old_posts_remaining_posts.php`
+  Reports the posts that remained live in the target years after `trash-posts`, with review reasons and an optional CSV for manual triage.
 - `wp_old_posts_attachment_leftovers.php`
   Audits files left on disk after real attachment deletion.
 - `wp_old_posts_leftovers_selection.php`
@@ -175,6 +178,8 @@ Key inputs:
 - `statuses=`
 - `batch-size=`
 - `scan-usage=`
+- `include-post-ids=`
+- `include-post-ids-file=`
 
 Key outputs:
 
@@ -203,7 +208,16 @@ Key protections:
 - optional external usage recheck for attachments
 - JSONL logs for resumable operations
 
-### 3. `wp_old_posts_attachment_leftovers.php`
+### 3. `wp_old_posts_remaining_posts.php`
+
+Purpose:
+
+- inspect the target years after `trash-posts`
+- list the posts that are still live
+- flag whether each post is already in the manifest or would need manual inclusion
+- optionally export the review list as CSV
+
+### 4. `wp_old_posts_attachment_leftovers.php`
 
 Purpose:
 
@@ -211,7 +225,7 @@ Purpose:
 - report base files and derivatives still present on disk
 - map grouped deletions back to the correct manifest attachment when WPML grouped deletion was used
 
-### 4. `wp_old_posts_leftovers_selection.php`
+### 5. `wp_old_posts_leftovers_selection.php`
 
 Purpose:
 
@@ -219,7 +233,7 @@ Purpose:
 - exclude items whose base file is still referenced
 - exclude exact leftover paths still referenced by live attachments
 
-### 5. `wp_old_posts_leftovers_delete.php`
+### 6. `wp_old_posts_leftovers_delete.php`
 
 Purpose:
 
@@ -227,7 +241,7 @@ Purpose:
 - delete only files present in the leftovers report
 - revalidate live attachment references before deleting each file
 
-### 6. `wp_old_posts_wpml_consistency.php`
+### 7. `wp_old_posts_wpml_consistency.php`
 
 Purpose:
 
