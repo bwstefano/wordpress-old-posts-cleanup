@@ -48,6 +48,8 @@ Recommended preflight checklist:
 
 Set these once per shell session. They keep the rest of the commands short and make it easy to rerun a single year without editing file paths everywhere.
 
+Important: commands that redirect output to paths like `>"$OLD_POSTS_OUTPUT_DIR/audit.out"` require these variables to already be exported in the current shell. Loading `old-posts.env` inside `run_wp_old_posts.sh` is too late for those outer shell redirections.
+
 ```bash
 export MANIFEST_PATH="$OLD_POSTS_OUTPUT_DIR/manifest.json"
 export REDIRECTS_PATH="$OLD_POSTS_OUTPUT_DIR/redirects.csv"
@@ -75,6 +77,8 @@ export WPML_JSONL="$OLD_POSTS_OUTPUT_DIR/wpml-consistency-$YEAR.jsonl"
 Recommended `nohup` pattern:
 
 ```bash
+source ./old-posts.env
+mkdir -p "$OLD_POSTS_OUTPUT_DIR"
 nohup sh -c '
 ./run_wp_old_posts.sh ...command...
 ' >"$OLD_POSTS_OUTPUT_DIR/some-job.out" 2>&1 &
