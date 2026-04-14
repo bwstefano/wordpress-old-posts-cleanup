@@ -470,14 +470,18 @@ old_posts_append_jsonl(
 );
 
 if ( 'trash-posts' === $phase || 'force-delete-posts' === $phase ) {
+	$stop_processing = false;
 	foreach ( array_chunk( $post_records, $batch_size ) as $post_batch ) {
+		$processed_object_ids = array();
 		foreach ( $post_batch as $post_record ) {
 			if ( $limit && $limit_counter >= $limit ) {
-				break 2;
+				$stop_processing = true;
+				break;
 			}
 
 			$post_id = (int) $post_record['post_id'];
 			$post    = get_post( $post_id );
+			$processed_object_ids[] = $post_id;
 
 			if ( 'trash-posts' === $phase && $post instanceof WP_Post && 'trash' === $post->post_status ) {
 				old_posts_log( 'info', 'Post is already in the trash. Skipping.', array( 'post_id' => $post_id ) );
@@ -696,19 +700,30 @@ if ( 'trash-posts' === $phase || 'force-delete-posts' === $phase ) {
 				)
 			);
 		}
+
+		// Long destructive runs can accumulate runtime cache entries unless we clear them between batches.
+		old_posts_release_wp_memory( $processed_object_ids );
+
+		if ( $stop_processing ) {
+			break;
+		}
 	}
 }
 
 if ( 'delete-attachments' === $phase ) {
+	$stop_processing = false;
 	foreach ( array_chunk( $attachment_records, $batch_size ) as $attachment_batch ) {
+		$processed_object_ids = array();
 		foreach ( $attachment_batch as $attachment_record ) {
 			if ( $limit && $limit_counter >= $limit ) {
-				break 2;
+				$stop_processing = true;
+				break;
 			}
 
 			$attachment_id = (int) $attachment_record['attachment_id'];
 			$attachment    = get_post( $attachment_id );
 			$root_exists   = $attachment instanceof WP_Post;
+			$processed_object_ids[] = $attachment_id;
 
 			if ( empty( $attachment_record['safe_to_delete'] ) ) {
 				old_posts_log( 'error', 'Attachment is marked unsafe in the manifest.', array( 'attachment_id' => $attachment_id ) );
@@ -946,6 +961,7 @@ if ( 'delete-attachments' === $phase ) {
 
 			$root_counted = false;
 			foreach ( $group_plan['delete_records'] as $delete_attachment_id => $delete_attachment_record ) {
+				$processed_object_ids[] = (int) $delete_attachment_id;
 				$status = 'dry-run';
 				if ( ! $dry_run ) {
 					$result = wp_delete_attachment( $delete_attachment_id, true );
@@ -1003,6 +1019,13 @@ if ( 'delete-attachments' === $phase ) {
 					)
 				);
 			}
+
+		}
+
+		old_posts_release_wp_memory( $processed_object_ids );
+
+		if ( $stop_processing ) {
+			break;
 		}
 	}
 }

@@ -206,6 +206,7 @@ Key protections:
 - confirmation tokens for destructive real runs
 - manifest fingerprint check for posts
 - optional external usage recheck for attachments
+- runtime cache cleanup between destructive batches to keep long WP-CLI runs stable
 - JSONL logs for resumable operations
 
 ### 3. `wp_old_posts_remaining_posts.php`
