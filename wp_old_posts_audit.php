@@ -31,17 +31,19 @@ old_posts_assert_parent_writable( $output_path, 'manifest JSON output' );
 global $wpdb;
 
 $placeholders = implode( ',', array_fill( 0, count( $statuses ), '%s' ) );
-$query        = $wpdb->prepare(
-	"SELECT ID FROM {$wpdb->posts}
+$count_query  = $wpdb->prepare(
+	"SELECT COUNT(*)
+	FROM {$wpdb->posts}
 	WHERE post_type = %s
 	AND post_date < %s
-	AND post_status IN ($placeholders)
-	ORDER BY ID ASC",
+	AND post_status IN ($placeholders)",
 	array_merge( array( $post_type, $before_date ), $statuses )
 );
 
-$pre_cutoff_post_ids = array_map( 'intval', $wpdb->get_col( $query ) );
-if ( 0 === count( $pre_cutoff_post_ids ) ) {
+$pre_cutoff_post_count = (int) $wpdb->get_var( $count_query );
+old_posts_release_wp_memory();
+
+if ( 0 === $pre_cutoff_post_count ) {
 	old_posts_fail(
 		'No posts matched the requested criteria.',
 		array(
@@ -56,7 +58,7 @@ old_posts_log(
 	'info',
 	'Starting the old-posts audit.',
 	array(
-		'pre_cutoff_posts' => count( $pre_cutoff_post_ids ),
+		'pre_cutoff_posts' => $pre_cutoff_post_count,
 		'usage_scan'       => $usage_scan,
 		'wpml_active'      => old_posts_wpml_active(),
 		'resolved_args'    => array(
@@ -83,9 +85,33 @@ $redirect_exportable_posts = 0;
 
 $total_scanned = 0;
 $scan_progress = old_posts_progress_state( $progress_cfg['every'], $progress_cfg['seconds'] );
+$last_scanned_id = 0;
+$stop_scan = false;
+while ( true ) {
+	$post_id_batch = array_map(
+		'intval',
+		$wpdb->get_col(
+			$wpdb->prepare(
+				"SELECT ID
+				FROM {$wpdb->posts}
+				WHERE post_type = %s
+				AND post_date < %s
+				AND post_status IN ($placeholders)
+				AND ID > %d
+				ORDER BY ID ASC
+				LIMIT %d",
+				array_merge( array( $post_type, $before_date ), $statuses, array( $last_scanned_id, $batch_size ) )
+			)
+		)
+	);
 
-foreach ( array_chunk( $pre_cutoff_post_ids, $batch_size ) as $post_id_batch ) {
+	if ( empty( $post_id_batch ) ) {
+		break;
+	}
+
+	$processed_object_ids = array();
 	foreach ( $post_id_batch as $post_id ) {
+		$last_scanned_id = (int) $post_id;
 		$post = get_post( $post_id );
 		if ( ! $post instanceof WP_Post ) {
 			continue;
@@ -96,7 +122,7 @@ foreach ( array_chunk( $pre_cutoff_post_ids, $batch_size ) as $post_id_batch ) {
 			$scan_progress,
 			'Scanning posts for deletion candidates.',
 			$total_scanned,
-			count( $pre_cutoff_post_ids ),
+			$pre_cutoff_post_count,
 			array(
 				'candidate_posts' => count( $candidate_posts ),
 			)
@@ -160,7 +186,6 @@ foreach ( array_chunk( $pre_cutoff_post_ids, $batch_size ) as $post_id_batch ) {
 			++$redirect_exportable_posts;
 		}
 
-		$attachment_records = array();
 		foreach ( $attachment_ids as $attachment_id ) {
 			if ( ! isset( $candidate_attachments[ $attachment_id ] ) ) {
 				$base_record = old_posts_attachment_record( $attachment_id );
@@ -168,22 +193,18 @@ foreach ( array_chunk( $pre_cutoff_post_ids, $batch_size ) as $post_id_batch ) {
 					continue;
 				}
 
-				$base_record['candidate_post_ids']          = array();
-				$base_record['usage_post_ids']              = array();
-				$base_record['non_candidate_usage_post_ids'] = array();
-				$base_record['safe_to_delete']              = false;
-				$base_record['risk_flags']                  = array();
-				$base_record['reasons_by_post_id']          = array();
-				$candidate_attachments[ $attachment_id ]    = $base_record;
+				$base_record['candidate_post_ids']                = array();
+				$base_record['usage_detected']                    = false;
+				$base_record['non_candidate_usage_detected']      = false;
+				$base_record['usage_post_ids_sample']             = array();
+				$base_record['non_candidate_usage_post_ids_sample'] = array();
+				$base_record['safe_to_delete']                    = false;
+				$base_record['risk_flags']                        = array();
+				$candidate_attachments[ $attachment_id ]          = $base_record;
+				$processed_object_ids[]                           = $attachment_id;
 			}
 
-			$candidate_attachments[ $attachment_id ]['candidate_post_ids'][]                   = (int) $post->ID;
-			$candidate_attachments[ $attachment_id ]['reasons_by_post_id'][ (string) $post->ID ] = array_values( array_unique( $attachment_reasons[ $attachment_id ] ) );
-
-			$attachment_records[] = array(
-				'attachment_id' => $attachment_id,
-				'reasons'       => array_values( array_unique( $attachment_reasons[ $attachment_id ] ) ),
-			);
+			$candidate_attachments[ $attachment_id ]['candidate_post_ids'][ (string) $post->ID ] = true;
 		}
 
 		$candidate_posts[] = array(
@@ -197,10 +218,7 @@ foreach ( array_chunk( $pre_cutoff_post_ids, $batch_size ) as $post_id_batch ) {
 			'permalink'          => $permalink,
 			'plain_text_length'  => $plain_text_length,
 			'featured_media'     => $featured_media,
-			'embedded_media_ids' => $embedded_ids,
-			'attached_media_ids' => $child_ids,
 			'attachment_ids'     => $attachment_ids,
-			'attachments'        => $attachment_records,
 			'wpml'               => $wpml_context,
 			'fingerprint'        => old_posts_post_fingerprint( $post ),
 			'redirect'           => array(
@@ -216,10 +234,18 @@ foreach ( array_chunk( $pre_cutoff_post_ids, $batch_size ) as $post_id_batch ) {
 		);
 
 		$candidate_post_ids[ $post->ID ] = true;
+		$processed_object_ids[]          = (int) $post->ID;
 
 		if ( $max_posts && count( $candidate_posts ) >= $max_posts ) {
-			break 2;
+			$stop_scan = true;
+			break;
 		}
+	}
+
+	old_posts_release_wp_memory( $processed_object_ids );
+
+	if ( $stop_scan ) {
+		break;
 	}
 }
 
@@ -227,7 +253,7 @@ old_posts_progress_maybe_log(
 	$scan_progress,
 	'Initial candidate scan complete.',
 	$total_scanned,
-	count( $pre_cutoff_post_ids ),
+	$pre_cutoff_post_count,
 	array(
 		'candidate_posts' => count( $candidate_posts ),
 	),
@@ -248,13 +274,13 @@ if ( $usage_scan && ! empty( $candidate_attachment_ids ) ) {
 		)
 	);
 
-	$usage_map      = array_fill_keys( $candidate_attachment_ids, array() );
 	$candidate_set  = array_fill_keys( $candidate_attachment_ids, true );
-	$chunked_ids    = array_chunk( $candidate_attachment_ids, 250 );
 	$usage_progress = old_posts_progress_state( max( 1, ceil( $progress_cfg['every'] / max( 1, $batch_size ) ) ), $progress_cfg['seconds'] );
 	$thumbnail_scan_processed = 0;
+	$candidate_attachment_count = count( $candidate_attachment_ids );
 
-	foreach ( $chunked_ids as $attachment_id_chunk ) {
+	for ( $offset = 0; $offset < $candidate_attachment_count; $offset += 250 ) {
+		$attachment_id_chunk = array_slice( $candidate_attachment_ids, $offset, 250 );
 		$in_sql        = implode( ',', array_fill( 0, count( $attachment_id_chunk ), '%d' ) );
 		$thumbnail_sql = $wpdb->prepare(
 			"SELECT post_id, meta_value
@@ -268,17 +294,29 @@ if ( $usage_scan && ! empty( $candidate_attachment_ids ) ) {
 		foreach ( $thumbnail_rows as $row ) {
 			$attachment_id = (int) $row['meta_value'];
 			$post_id       = (int) $row['post_id'];
-			$usage_map[ $attachment_id ][] = $post_id;
+			if ( ! isset( $candidate_attachments[ $attachment_id ] ) || ! $post_id ) {
+				continue;
+			}
+
+			$candidate_attachments[ $attachment_id ]['usage_detected'] = true;
+			old_posts_sample_int_list_add( $candidate_attachments[ $attachment_id ]['usage_post_ids_sample'], $post_id );
+
+			if ( ! isset( $candidate_post_ids[ $post_id ] ) ) {
+				$candidate_attachments[ $attachment_id ]['non_candidate_usage_detected'] = true;
+				old_posts_sample_int_list_add( $candidate_attachments[ $attachment_id ]['non_candidate_usage_post_ids_sample'], $post_id );
+			}
 		}
 		$thumbnail_scan_processed += count( $attachment_id_chunk );
+		unset( $thumbnail_rows );
+		old_posts_release_wp_memory();
 
 		old_posts_progress_maybe_log(
 			$usage_progress,
 			'Scanning featured-image references.',
 			$thumbnail_scan_processed,
-			count( $candidate_attachment_ids ),
+			$candidate_attachment_count,
 			array(
-				'candidate_attachments' => count( $candidate_attachment_ids ),
+				'candidate_attachments' => $candidate_attachment_count,
 			)
 		);
 	}
@@ -287,9 +325,9 @@ if ( $usage_scan && ! empty( $candidate_attachment_ids ) ) {
 		$usage_progress,
 		'Featured-image scan complete.',
 		$thumbnail_scan_processed,
-		count( $candidate_attachment_ids ),
+		$candidate_attachment_count,
 		array(
-			'candidate_attachments' => count( $candidate_attachment_ids ),
+			'candidate_attachments' => $candidate_attachment_count,
 		),
 		array(
 			'force' => true,
@@ -347,8 +385,14 @@ if ( $usage_scan && ! empty( $candidate_attachment_ids ) ) {
 			}
 
 			foreach ( $refs as $attachment_id ) {
-				if ( isset( $candidate_set[ $attachment_id ] ) ) {
-					$usage_map[ $attachment_id ][] = (int) $row['ID'];
+				if ( isset( $candidate_set[ $attachment_id ] ) && isset( $candidate_attachments[ $attachment_id ] ) ) {
+					$candidate_attachments[ $attachment_id ]['usage_detected'] = true;
+					old_posts_sample_int_list_add( $candidate_attachments[ $attachment_id ]['usage_post_ids_sample'], (int) $row['ID'] );
+
+					if ( ! isset( $candidate_post_ids[ (int) $row['ID'] ] ) ) {
+						$candidate_attachments[ $attachment_id ]['non_candidate_usage_detected'] = true;
+						old_posts_sample_int_list_add( $candidate_attachments[ $attachment_id ]['non_candidate_usage_post_ids_sample'], (int) $row['ID'] );
+					}
 				}
 			}
 
@@ -362,6 +406,9 @@ if ( $usage_scan && ! empty( $candidate_attachment_ids ) ) {
 				)
 			);
 		}
+
+		unset( $content_rows );
+		old_posts_release_wp_memory();
 	}
 
 	old_posts_progress_maybe_log(
@@ -377,41 +424,40 @@ if ( $usage_scan && ! empty( $candidate_attachment_ids ) ) {
 		)
 	);
 
-	foreach ( $candidate_attachments as $attachment_id => &$attachment_record ) {
-		$usage_post_ids = isset( $usage_map[ $attachment_id ] ) ? $usage_map[ $attachment_id ] : array();
-		$usage_post_ids = array_values( array_unique( array_map( 'intval', $usage_post_ids ) ) );
-		sort( $usage_post_ids );
-
-		$non_candidate_usage_post_ids = array_values(
-			array_filter(
-				$usage_post_ids,
-				static function ( $post_id ) use ( $candidate_post_ids ) {
-					return ! isset( $candidate_post_ids[ $post_id ] );
-				}
-			)
-		);
-
-		$risk_flags = array();
-		if ( ! empty( $non_candidate_usage_post_ids ) ) {
-			$risk_flags[] = 'used_by_non_candidate_post';
-		}
-
-		if ( ! empty( $attachment_record['post_parent'] ) && ! isset( $candidate_post_ids[ $attachment_record['post_parent'] ] ) ) {
-			$risk_flags[] = 'attached_to_non_candidate_post';
-		}
-
-		if ( empty( $usage_post_ids ) ) {
-			$risk_flags[] = 'no_detected_content_or_thumbnail_usage';
-		}
-
-		$attachment_record['candidate_post_ids']           = array_values( array_unique( array_map( 'intval', $attachment_record['candidate_post_ids'] ) ) );
-		$attachment_record['usage_post_ids']               = $usage_post_ids;
-		$attachment_record['non_candidate_usage_post_ids'] = $non_candidate_usage_post_ids;
-		$attachment_record['risk_flags']                   = array_values( array_unique( $risk_flags ) );
-		$attachment_record['safe_to_delete']               = empty( $non_candidate_usage_post_ids ) && ( empty( $attachment_record['post_parent'] ) || isset( $candidate_post_ids[ $attachment_record['post_parent'] ] ) );
-	}
-	unset( $attachment_record );
 }
+
+foreach ( $candidate_attachments as $attachment_id => &$attachment_record ) {
+	$usage_detected               = ! empty( $attachment_record['usage_detected'] );
+	$non_candidate_usage_detected = ! empty( $attachment_record['non_candidate_usage_detected'] );
+
+	$risk_flags = array();
+	if ( ! $usage_scan ) {
+		$risk_flags[] = 'usage_scan_disabled';
+	}
+
+	if ( $non_candidate_usage_detected ) {
+		$risk_flags[] = 'used_by_non_candidate_post';
+	}
+
+	if ( ! empty( $attachment_record['post_parent'] ) && ! isset( $candidate_post_ids[ $attachment_record['post_parent'] ] ) ) {
+		$risk_flags[] = 'attached_to_non_candidate_post';
+	}
+
+	if ( $usage_scan && ! $usage_detected ) {
+		$risk_flags[] = 'no_detected_content_or_thumbnail_usage';
+	}
+
+	$attachment_record['candidate_post_ids']                  = old_posts_unique_int_keys( $attachment_record['candidate_post_ids'] );
+	$attachment_record['usage_detected']                      = $usage_detected;
+	$attachment_record['non_candidate_usage_detected']        = $non_candidate_usage_detected;
+	$attachment_record['usage_post_ids_sample']               = array_values( array_map( 'intval', $attachment_record['usage_post_ids_sample'] ) );
+	$attachment_record['non_candidate_usage_post_ids_sample'] = array_values( array_map( 'intval', $attachment_record['non_candidate_usage_post_ids_sample'] ) );
+	$attachment_record['risk_flags']                          = array_values( array_unique( $risk_flags ) );
+	$attachment_record['safe_to_delete']                      = $usage_scan
+		&& ! $non_candidate_usage_detected
+		&& ( empty( $attachment_record['post_parent'] ) || isset( $candidate_post_ids[ $attachment_record['post_parent'] ] ) );
+}
+unset( $attachment_record );
 
 $attachment_records = array_values( $candidate_attachments );
 usort(
@@ -420,6 +466,8 @@ usort(
 		return $a['attachment_id'] <=> $b['attachment_id'];
 	}
 );
+unset( $candidate_attachments, $candidate_attachment_ids, $candidate_post_ids );
+old_posts_release_wp_memory();
 
 $safe_attachment_count = 0;
 foreach ( $attachment_records as $attachment_record ) {
