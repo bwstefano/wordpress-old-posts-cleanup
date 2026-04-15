@@ -67,6 +67,17 @@ if ( ! function_exists( 'old_posts_runtime_arg_duplicates' ) ) {
 	}
 }
 
+if ( ! function_exists( 'old_posts_normalize_runtime_arg_value' ) ) {
+	function old_posts_normalize_runtime_arg_value( $key, $value ) {
+		if ( 'path' === (string) $key && is_string( $value ) ) {
+			$normalized = rtrim( trim( $value ), '/\\' );
+			return '' === $normalized ? '/' : $normalized;
+		}
+
+		return $value;
+	}
+}
+
 if ( ! function_exists( 'old_posts_collect_runtime_args' ) ) {
 	function old_posts_collect_runtime_args( $wp_cli_args = array(), $argv = array() ) {
 		$merged     = array();
@@ -83,10 +94,11 @@ if ( ! function_exists( 'old_posts_collect_runtime_args' ) ) {
 
 		foreach ( $sources as $pairs ) {
 			foreach ( $pairs as $pair ) {
-				$key   = $pair['key'];
-				$value = $pair['value'];
+				$key              = $pair['key'];
+				$value            = $pair['value'];
+				$normalized_value = old_posts_normalize_runtime_arg_value( $key, $value );
 
-				if ( array_key_exists( $key, $merged ) && wp_json_encode( $merged[ $key ] ) !== wp_json_encode( $value ) ) {
+				if ( array_key_exists( $key, $merged ) && wp_json_encode( old_posts_normalize_runtime_arg_value( $key, $merged[ $key ] ) ) !== wp_json_encode( $normalized_value ) ) {
 					if ( ! isset( $duplicates[ $key ] ) ) {
 						$duplicates[ $key ] = array();
 					}

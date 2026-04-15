@@ -722,6 +722,7 @@ if ( 'trash-posts' === $phase || 'force-delete-posts' === $phase ) {
 }
 
 if ( 'delete-attachments' === $phase ) {
+	$attachment_records_processed = 0;
 	$stop_processing = false;
 	foreach ( array_chunk( $attachment_records, $batch_size ) as $attachment_batch ) {
 		$processed_object_ids = array();
@@ -731,6 +732,7 @@ if ( 'delete-attachments' === $phase ) {
 				break;
 			}
 
+			$attachment_progress_index = $attachment_records_processed + 1;
 			$attachment_id          = (int) $attachment_record['attachment_id'];
 			$attachment             = get_post( $attachment_id );
 			$root_exists            = $attachment instanceof WP_Post;
@@ -752,14 +754,16 @@ if ( 'delete-attachments' === $phase ) {
 				);
 				++$failures;
 				old_posts_increment_counters( $processed, $limit_counter );
+				$attachment_records_processed = $attachment_progress_index;
 				old_posts_progress_maybe_log(
 					$progress_state,
 					'Execution progress.',
-					$limit > 0 ? $limit_counter : $processed,
+					$limit > 0 ? $limit_counter : $attachment_records_processed,
 					$progress_goal,
 					array(
-						'processed_records' => $processed,
+						'processed_records' => $attachment_records_processed,
 						'total_records'     => $total_records,
+						'processed_attachments' => $processed,
 						'phase'             => $phase,
 						'failures'          => $failures,
 					),
@@ -792,14 +796,16 @@ if ( 'delete-attachments' === $phase ) {
 					);
 					++$failures;
 					old_posts_increment_counters( $processed, $limit_counter );
+					$attachment_records_processed = $attachment_progress_index;
 					old_posts_progress_maybe_log(
 						$progress_state,
 						'Execution progress.',
-						$limit > 0 ? $limit_counter : $processed,
+						$limit > 0 ? $limit_counter : $attachment_records_processed,
 						$progress_goal,
 						array(
-							'processed_records' => $processed,
+							'processed_records' => $attachment_records_processed,
 							'total_records'     => $total_records,
+							'processed_attachments' => $processed,
 							'phase'             => $phase,
 							'failures'          => $failures,
 						),
@@ -842,14 +848,16 @@ if ( 'delete-attachments' === $phase ) {
 						)
 					);
 					old_posts_increment_counters( $processed, $limit_counter, ! $limit_ignore_already_removed );
+					$attachment_records_processed = $attachment_progress_index;
 					old_posts_progress_maybe_log(
 						$progress_state,
 						'Execution progress.',
-						$limit > 0 ? $limit_counter : $processed,
+						$limit > 0 ? $limit_counter : $attachment_records_processed,
 						$progress_goal,
 						array(
-							'processed_records' => $processed,
+							'processed_records' => $attachment_records_processed,
 							'total_records'     => $total_records,
+							'processed_attachments' => $processed,
 							'phase'             => $phase,
 							'failures'          => $failures,
 						),
@@ -954,14 +962,16 @@ if ( 'delete-attachments' === $phase ) {
 
 			if ( ! $root_exists && empty( $group_plan['delete_records'] ) ) {
 				old_posts_increment_counters( $processed, $limit_counter );
+				$attachment_records_processed = $attachment_progress_index;
 				old_posts_progress_maybe_log(
 					$progress_state,
 					'Execution progress.',
-					$limit > 0 ? $limit_counter : $processed,
+					$limit > 0 ? $limit_counter : $attachment_records_processed,
 					$progress_goal,
 					array(
-						'processed_records' => $processed,
+						'processed_records' => $attachment_records_processed,
 						'total_records'     => $total_records,
+						'processed_attachments' => $processed,
 						'phase'             => $phase,
 						'failures'          => $failures,
 					),
@@ -1016,14 +1026,16 @@ if ( 'delete-attachments' === $phase ) {
 				}
 
 				old_posts_increment_counters( $processed, $limit_counter, $count_toward_limit );
+				$attachment_records_processed = $attachment_progress_index;
 				old_posts_progress_maybe_log(
 					$progress_state,
 					'Execution progress.',
-					$limit > 0 ? $limit_counter : $processed,
+					$limit > 0 ? $limit_counter : $attachment_records_processed,
 					$progress_goal,
 					array(
-						'processed_records' => $processed,
+						'processed_records' => $attachment_records_processed,
 						'total_records'     => $total_records,
+						'processed_attachments' => $processed,
 						'phase'             => $phase,
 						'failures'          => $failures,
 					),
@@ -1045,17 +1057,26 @@ if ( 'delete-attachments' === $phase ) {
 	}
 }
 
+$progress_current = $limit > 0 ? $limit_counter : $processed;
+$progress_context = array(
+	'processed_records' => $processed,
+	'total_records'     => $total_records,
+	'phase'             => $phase,
+	'failures'          => $failures,
+);
+
+if ( 'delete-attachments' === $phase ) {
+	$progress_current                       = $limit > 0 ? $limit_counter : $attachment_records_processed;
+	$progress_context['processed_records']  = $attachment_records_processed;
+	$progress_context['processed_attachments'] = $processed;
+}
+
 old_posts_progress_maybe_log(
 	$progress_state,
 	'Execution progress complete.',
-	$limit > 0 ? $limit_counter : $processed,
+	$progress_current,
 	$progress_goal,
-	array(
-		'processed_records' => $processed,
-		'total_records'     => $total_records,
-		'phase'             => $phase,
-		'failures'          => $failures,
-	),
+	$progress_context,
 	array(
 		'phase'    => $phase,
 		'log_path' => $log_path,
