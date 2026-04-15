@@ -167,13 +167,14 @@ function old_posts_attachment_runtime_record( $attachment_id, $attachment_record
 	return old_posts_attachment_record( $attachment_id );
 }
 
-function old_posts_attachment_group_delete_plan( $attachment_record, $attachment_record_map, $candidate_post_ids, $recheck_usage, $scan_postmeta, $root_exists = true ) {
-	$attachment_id         = (int) $attachment_record['attachment_id'];
-	$same_file_ids         = old_posts_attachment_same_file_attachment_ids( $attachment_record['file'] ?? '' );
-	$wpml_translation_ids  = old_posts_attachment_wpml_translation_ids( $attachment_record );
-	$outside_wpml_ids      = array_values( array_diff( $same_file_ids, $wpml_translation_ids ) );
-	$delete_records        = array();
-	$blocking_attachments  = array();
+function old_posts_attachment_group_delete_plan( $attachment_record, $attachment_record_map, $candidate_post_ids, $recheck_usage, $scan_postmeta, $root_exists = true, $skip_recheck_attachment_ids = array() ) {
+	$attachment_id               = (int) $attachment_record['attachment_id'];
+	$same_file_ids               = old_posts_attachment_same_file_attachment_ids( $attachment_record['file'] ?? '' );
+	$wpml_translation_ids        = old_posts_attachment_wpml_translation_ids( $attachment_record );
+	$outside_wpml_ids            = array_values( array_diff( $same_file_ids, $wpml_translation_ids ) );
+	$delete_records              = array();
+	$blocking_attachments        = array();
+	$skip_recheck_attachment_ids = array_fill_keys( array_values( array_filter( array_map( 'intval', (array) $skip_recheck_attachment_ids ) ) ), true );
 
 	if ( $root_exists ) {
 		$delete_records[ $attachment_id ] = $attachment_record;
@@ -263,7 +264,7 @@ function old_posts_attachment_group_delete_plan( $attachment_record, $attachment
 			continue;
 		}
 
-		if ( $recheck_usage ) {
+		if ( $recheck_usage && ! isset( $skip_recheck_attachment_ids[ $related_attachment_id ] ) ) {
 			$external_usage = old_posts_attachment_has_external_usage( $related_record, $candidate_post_ids, $scan_postmeta );
 			if ( null !== $external_usage ) {
 				$blocking_attachments[] = array_merge(
@@ -318,6 +319,7 @@ $cli_args = old_posts_collect_runtime_args(
 	isset( $args ) && is_array( $args ) ? $args : array(),
 	isset( $GLOBALS['argv'] ) && is_array( $GLOBALS['argv'] ) ? $GLOBALS['argv'] : array()
 );
+$duplicate_cli_args = old_posts_runtime_arg_duplicates();
 
 $manifest_path = isset( $cli_args['manifest'] ) ? (string) $cli_args['manifest'] : old_posts_default_temp_path( 'old-posts-manifest.json' );
 $phase         = isset( $cli_args['phase'] ) ? (string) $cli_args['phase'] : 'trash-posts';
@@ -333,6 +335,16 @@ $log_path      = isset( $cli_args['log'] ) ? (string) $cli_args['log'] : old_pos
 $output_path   = isset( $cli_args['output'] ) ? (string) $cli_args['output'] : old_posts_default_temp_path( 'old-posts-redirects.csv' );
 
 $manifest = old_posts_read_manifest( $manifest_path );
+
+if ( ! empty( $duplicate_cli_args ) ) {
+	old_posts_log(
+		'warning',
+		'Some runtime arguments were provided more than once; the last value will be used.',
+		array(
+			'duplicates' => $duplicate_cli_args,
+		)
+	);
+}
 
 if ( trailingslashit( home_url( '/' ) ) !== trailingslashit( $manifest['site']['home_url'] ) ) {
 	old_posts_fail(
@@ -420,11 +432,9 @@ foreach ( $manifest['attachments'] as $attachment_record ) {
 	if ( $year_filter ) {
 		$belongs_to_year = false;
 		foreach ( $attachment_record['candidate_post_ids'] as $candidate_post_id ) {
-			foreach ( $post_records as $post_record ) {
-				if ( (int) $post_record['post_id'] === (int) $candidate_post_id && 0 === strpos( (string) $post_record['post_date'], $year_filter ) ) {
-					$belongs_to_year = true;
-					break 2;
-				}
+			if ( isset( $candidate_post_ids[ (int) $candidate_post_id ] ) ) {
+				$belongs_to_year = true;
+				break;
 			}
 		}
 
@@ -462,6 +472,7 @@ old_posts_append_jsonl(
 		'post_records'   => count( $post_records ),
 		'attachments'    => count( $attachment_records ),
 		'recheck_usage'  => $recheck_usage,
+		'duplicate_args' => $duplicate_cli_args,
 		'limit_ignore_already_removed' => $limit_ignore_already_removed,
 		'progress_every' => $progress_cfg['every'],
 		'progress_seconds' => $progress_cfg['seconds'],
@@ -720,9 +731,10 @@ if ( 'delete-attachments' === $phase ) {
 				break;
 			}
 
-			$attachment_id = (int) $attachment_record['attachment_id'];
-			$attachment    = get_post( $attachment_id );
-			$root_exists   = $attachment instanceof WP_Post;
+			$attachment_id          = (int) $attachment_record['attachment_id'];
+			$attachment             = get_post( $attachment_id );
+			$root_exists            = $attachment instanceof WP_Post;
+			$skip_group_recheck_ids = array();
 			$processed_object_ids[] = $attachment_id;
 
 			if ( empty( $attachment_record['safe_to_delete'] ) ) {
@@ -799,6 +811,8 @@ if ( 'delete-attachments' === $phase ) {
 					);
 					continue;
 				}
+
+				$skip_group_recheck_ids[] = $attachment_id;
 			}
 
 			$group_plan = old_posts_attachment_group_delete_plan(
@@ -807,7 +821,8 @@ if ( 'delete-attachments' === $phase ) {
 				$candidate_post_ids,
 				$recheck_usage,
 				$scan_postmeta,
-				$root_exists
+				$root_exists,
+				$skip_group_recheck_ids
 			);
 
 			$logged_root_already_removed = false;
