@@ -458,6 +458,22 @@ $total_records = 'delete-attachments' === $phase ? count( $attachment_records ) 
 $progress_goal = $limit > 0 ? $limit : $total_records;
 $progress_state = old_posts_progress_state( $progress_cfg['every'], $progress_cfg['seconds'] );
 
+if ( '' !== $log_path && file_exists( $log_path ) ) {
+	$existing_log_size = filesize( $log_path );
+	if ( false !== $existing_log_size && $existing_log_size > 0 ) {
+		old_posts_log(
+			'warning',
+			'The JSONL log file already exists and this execution will append new events to it.',
+			array(
+				'path'       => $log_path,
+				'phase'      => $phase,
+				'year_filter' => $year_filter,
+				'size_bytes' => (int) $existing_log_size,
+			)
+		);
+	}
+}
+
 old_posts_append_jsonl(
 	$log_path,
 	array(
@@ -1016,6 +1032,24 @@ if ( 'delete-attachments' === $phase ) {
 						'root_exists'             => $root_exists,
 					)
 				);
+
+				$delete_log_context = array(
+					'attachment_id'           => (int) $delete_attachment_id,
+					'group_root_attachment_id' => $attachment_id,
+					'deletion_scope'          => $group_plan['group_delete_enabled'] ? 'wpml_file_group' : 'single_attachment',
+					'shared_file_group_size'  => count( $group_plan['delete_records'] ),
+				);
+				if ( ! empty( $delete_attachment_record['file'] ) ) {
+					$delete_log_context['file'] = (string) $delete_attachment_record['file'];
+				}
+
+				if ( 'failed' === $status ) {
+					old_posts_log( 'error', 'Attachment delete failed.', $delete_log_context );
+				} elseif ( 'dry-run' === $status ) {
+					old_posts_log( 'info', 'Attachment would be deleted.', $delete_log_context );
+				} else {
+					old_posts_log( 'info', 'Attachment deleted.', $delete_log_context );
+				}
 
 				$count_toward_limit = false;
 				if ( $root_exists ) {

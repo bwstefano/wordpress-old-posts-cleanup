@@ -227,6 +227,9 @@ if ( ! function_exists( 'old_posts_log' ) ) {
 		}
 
 		fwrite( STDERR, $line . PHP_EOL );
+		if ( is_resource( STDERR ) ) {
+			fflush( STDERR );
+		}
 	}
 }
 
