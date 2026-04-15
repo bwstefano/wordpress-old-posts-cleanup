@@ -315,6 +315,431 @@ function old_posts_increment_counters( &$processed, &$limit_counter, $count_towa
 	}
 }
 
+function old_posts_resume_normalize_path( $path ) {
+	$path = trim( (string) $path );
+	if ( '' === $path ) {
+		return '';
+	}
+
+	$real_path = realpath( $path );
+	if ( false !== $real_path && '' !== $real_path ) {
+		$path = (string) $real_path;
+	}
+
+	$path = preg_replace( '#/+#', '/', str_replace( '\\', '/', $path ) );
+	$path = rtrim( (string) $path, '/' );
+
+	return '' === $path ? '/' : $path;
+}
+
+function old_posts_resume_log_paths( $cli_args ) {
+	$paths = array();
+
+	if ( ! empty( $cli_args['resume-log'] ) ) {
+		$paths = array_merge( $paths, old_posts_csv_arg( $cli_args['resume-log'] ) );
+	}
+
+	if ( ! empty( $cli_args['resume-log-glob'] ) ) {
+		$globbed = glob( (string) $cli_args['resume-log-glob'] );
+		if ( false !== $globbed ) {
+			$paths = array_merge( $paths, $globbed );
+		}
+	}
+
+	$paths = array_values(
+		array_unique(
+			array_filter(
+				array_map(
+					static function ( $path ) {
+						return trim( (string) $path );
+					},
+					$paths
+				),
+				'strlen'
+			)
+		)
+	);
+
+	if ( empty( $paths ) ) {
+		old_posts_fail(
+			'No resume JSONL logs matched the provided arguments.',
+			array(
+				'resume-log'      => $cli_args['resume-log'] ?? '',
+				'resume-log-glob' => $cli_args['resume-log-glob'] ?? '',
+			)
+		);
+	}
+
+	foreach ( $paths as $path ) {
+		if ( ! file_exists( $path ) ) {
+			old_posts_fail( 'Resume JSONL log not found.', array( 'path' => $path ) );
+		}
+	}
+
+	return $paths;
+}
+
+function old_posts_resume_log_matches_execution( $entry, $phase, $manifest_path, $year_filter ) {
+	if ( ! is_array( $entry ) ) {
+		return false;
+	}
+
+	if ( 'start_execution' !== ( $entry['action'] ?? null ) ) {
+		return false;
+	}
+
+	if ( (string) ( $entry['phase'] ?? '' ) !== (string) $phase ) {
+		return false;
+	}
+
+	if ( ! empty( $entry['dry_run'] ) ) {
+		return false;
+	}
+
+	$expected_manifest = old_posts_resume_normalize_path( $manifest_path );
+	$entry_manifest    = old_posts_resume_normalize_path( $entry['manifest_path'] ?? '' );
+	if ( '' === $expected_manifest || '' === $entry_manifest || $entry_manifest !== $expected_manifest ) {
+		return false;
+	}
+
+	$expected_year = null === $year_filter ? '' : trim( (string) $year_filter );
+	$entry_year    = isset( $entry['year_filter'] ) ? trim( (string) $entry['year_filter'] ) : '';
+
+	return $entry_year === $expected_year;
+}
+
+function old_posts_resume_mark_terminal_root( &$resume_state, $attachment_id, $reason, $resume_log_path ) {
+	$attachment_id = (int) $attachment_id;
+	if ( ! $attachment_id || isset( $resume_state['terminal_roots'][ $attachment_id ] ) ) {
+		return;
+	}
+
+	$resume_state['terminal_roots'][ $attachment_id ] = array(
+		'reason'          => (string) $reason,
+		'resume_log_path' => (string) $resume_log_path,
+	);
+}
+
+function old_posts_delete_attachments_resume_skip_candidate_count( $resume_state ) {
+	$count = count( $resume_state['terminal_roots'] ?? array() );
+
+	foreach ( $resume_state['deleted_attachment_ids'] ?? array() as $attachment_id => $resume_item ) {
+		$attachment_id = (int) $attachment_id;
+		if ( isset( $resume_state['terminal_roots'][ $attachment_id ] ) ) {
+			continue;
+		}
+
+		if ( isset( $resume_state['incomplete_group_roots'][ $attachment_id ] ) ) {
+			continue;
+		}
+
+		++$count;
+	}
+
+	return $count;
+}
+
+function old_posts_delete_attachments_resume_state( $log_paths, $manifest_path, $year_filter ) {
+	$resume_state = array(
+		'terminal_roots'          => array(),
+		'deleted_attachment_ids'  => array(),
+		'group_roots'             => array(),
+		'incomplete_group_roots'  => array(),
+		'matched_execution_count' => 0,
+		'matched_log_paths'       => array(),
+		'skip_candidate_count'    => 0,
+	);
+
+	foreach ( $log_paths as $log_path ) {
+		$handle = fopen( $log_path, 'r' );
+		if ( false === $handle ) {
+			old_posts_fail( 'Could not open the resume JSONL log.', array( 'path' => $log_path ) );
+		}
+
+		$current_execution_matches = false;
+
+		while ( false !== ( $line = fgets( $handle ) ) ) {
+			$line = trim( $line );
+			if ( '' === $line ) {
+				continue;
+			}
+
+			$entry = json_decode( $line, true );
+			if ( ! is_array( $entry ) ) {
+				continue;
+			}
+
+			if ( 'start_execution' === ( $entry['action'] ?? null ) ) {
+				$current_execution_matches = old_posts_resume_log_matches_execution(
+					$entry,
+					'delete-attachments',
+					$manifest_path,
+					$year_filter
+				);
+
+				if ( $current_execution_matches ) {
+					++$resume_state['matched_execution_count'];
+					$resume_state['matched_log_paths'][ $log_path ] = true;
+				}
+
+				continue;
+			}
+
+			if ( ! $current_execution_matches ) {
+				continue;
+			}
+
+			if ( 'delete-attachments' !== ( $entry['phase'] ?? null ) ) {
+				continue;
+			}
+
+			if ( ! empty( $entry['dry_run'] ) ) {
+				continue;
+			}
+
+			$action        = isset( $entry['action'] ) ? (string) $entry['action'] : '';
+			$status        = isset( $entry['status'] ) ? (string) $entry['status'] : '';
+			$attachment_id = isset( $entry['attachment_id'] ) ? (int) $entry['attachment_id'] : 0;
+
+			if ( 'skip_attachment' === $action ) {
+				if ( $attachment_id && 'unsafe_in_manifest' === $status ) {
+					old_posts_resume_mark_terminal_root( $resume_state, $attachment_id, 'unsafe_in_manifest', $log_path );
+				} elseif ( $attachment_id && 'already_removed' === $status && empty( $entry['group_followup'] ) ) {
+					old_posts_resume_mark_terminal_root( $resume_state, $attachment_id, 'already_removed', $log_path );
+				}
+
+				continue;
+			}
+
+			if ( 'delete_attachment' !== $action || 'ok' !== $status || ! $attachment_id ) {
+				continue;
+			}
+
+			if ( ! isset( $resume_state['deleted_attachment_ids'][ $attachment_id ] ) ) {
+				$resume_state['deleted_attachment_ids'][ $attachment_id ] = array(
+					'resume_log_path' => (string) $log_path,
+				);
+			}
+
+			$group_root_attachment_id = isset( $entry['group_root_attachment_id'] ) ? (int) $entry['group_root_attachment_id'] : 0;
+			$deletion_scope           = isset( $entry['deletion_scope'] ) ? (string) $entry['deletion_scope'] : '';
+			if ( 'wpml_file_group' !== $deletion_scope || ! $group_root_attachment_id ) {
+				continue;
+			}
+
+			if ( ! isset( $resume_state['group_roots'][ $group_root_attachment_id ] ) ) {
+				$resume_state['group_roots'][ $group_root_attachment_id ] = array(
+					'expected_group_size'    => 0,
+					'deleted_attachment_ids' => array(),
+					'resume_log_path'        => (string) $log_path,
+				);
+			}
+
+			$expected_group_size = isset( $entry['shared_file_group_size'] ) ? max( 0, (int) $entry['shared_file_group_size'] ) : 0;
+			if ( $expected_group_size > $resume_state['group_roots'][ $group_root_attachment_id ]['expected_group_size'] ) {
+				$resume_state['group_roots'][ $group_root_attachment_id ]['expected_group_size'] = $expected_group_size;
+			}
+
+			$resume_state['group_roots'][ $group_root_attachment_id ]['deleted_attachment_ids'][ $attachment_id ] = true;
+		}
+
+		fclose( $handle );
+	}
+
+	foreach ( $resume_state['group_roots'] as $group_root_attachment_id => $group_state ) {
+		$deleted_count = count( $group_state['deleted_attachment_ids'] );
+		$expected      = (int) $group_state['expected_group_size'];
+
+		if ( $expected > 0 && $deleted_count >= $expected ) {
+			old_posts_resume_mark_terminal_root(
+				$resume_state,
+				$group_root_attachment_id,
+				'completed_wpml_file_group',
+				$group_state['resume_log_path']
+			);
+			continue;
+		}
+
+		$resume_state['incomplete_group_roots'][ (int) $group_root_attachment_id ] = array(
+			'deleted_count'   => $deleted_count,
+			'expected_count'  => $expected,
+			'resume_log_path' => $group_state['resume_log_path'],
+		);
+	}
+
+	$resume_state['matched_log_paths']    = array_values( array_keys( $resume_state['matched_log_paths'] ) );
+	$resume_state['skip_candidate_count'] = old_posts_delete_attachments_resume_skip_candidate_count( $resume_state );
+
+	return $resume_state;
+}
+
+function old_posts_delete_attachments_resume_count_toward_limit( $reason, $limit_ignore_already_removed ) {
+	if ( in_array( $reason, array( 'already_removed', 'previously_deleted', 'completed_wpml_file_group' ), true ) ) {
+		return ! $limit_ignore_already_removed;
+	}
+
+	return true;
+}
+
+function old_posts_delete_attachments_resume_skip( $attachment_id, $resume_state, $limit_ignore_already_removed = false ) {
+	$attachment_id = (int) $attachment_id;
+	if ( ! $attachment_id ) {
+		return null;
+	}
+
+	if ( ! empty( $resume_state['terminal_roots'][ $attachment_id ] ) ) {
+		$resume_item = $resume_state['terminal_roots'][ $attachment_id ];
+		$reason      = (string) $resume_item['reason'];
+
+		return array(
+			'reason'             => $reason,
+			'resume_log_path'    => (string) ( $resume_item['resume_log_path'] ?? '' ),
+			'count_toward_limit' => old_posts_delete_attachments_resume_count_toward_limit( $reason, $limit_ignore_already_removed ),
+		);
+	}
+
+	if ( ! empty( $resume_state['deleted_attachment_ids'][ $attachment_id ] ) && empty( $resume_state['incomplete_group_roots'][ $attachment_id ] ) ) {
+		$resume_item = $resume_state['deleted_attachment_ids'][ $attachment_id ];
+
+		return array(
+			'reason'             => 'previously_deleted',
+			'resume_log_path'    => (string) ( $resume_item['resume_log_path'] ?? '' ),
+			'count_toward_limit' => old_posts_delete_attachments_resume_count_toward_limit( 'previously_deleted', $limit_ignore_already_removed ),
+		);
+	}
+
+	return null;
+}
+
+function old_posts_env_string( $name, $default = '' ) {
+	$value = getenv( $name );
+	if ( false === $value ) {
+		return $default;
+	}
+
+	$value = trim( (string) $value );
+	return '' === $value ? $default : $value;
+}
+
+function old_posts_log_text_snippet( $text, $limit = 1500 ) {
+	$text = trim( (string) $text );
+	if ( '' === $text ) {
+		return '';
+	}
+
+	if ( strlen( $text ) <= $limit ) {
+		return $text;
+	}
+
+	return substr( $text, 0, max( 0, $limit - 3 ) ) . '...';
+}
+
+function old_posts_delete_attachment_via_wp_cli( $attachment_id, $extra_skip_plugins = array(), $skip_themes = true ) {
+	$wp_root = defined( 'ABSPATH' ) ? rtrim( ABSPATH, '/\\' ) : old_posts_env_string( 'OLD_POSTS_WP_ROOT', '' );
+	if ( '' === $wp_root ) {
+		return array(
+			'ok'        => false,
+			'transport' => 'wp-cli',
+			'stderr'    => 'WordPress root is not available for isolated attachment deletion.',
+		);
+	}
+
+	if ( ! function_exists( 'proc_open' ) ) {
+		return array(
+			'ok'        => false,
+			'transport' => 'wp-cli',
+			'stderr'    => 'proc_open() is unavailable, so isolated attachment deletion cannot run.',
+		);
+	}
+
+	$wp_binary         = old_posts_env_string( 'OLD_POSTS_WP_CLI_BIN', 'wp' );
+	$base_skip_plugins = old_posts_csv_arg( old_posts_env_string( 'OLD_POSTS_SKIP_PLUGINS', '' ), array() );
+	$skip_plugins      = array_values(
+		array_unique(
+			array_filter(
+				array_map(
+					'trim',
+					array_merge( $base_skip_plugins, (array) $extra_skip_plugins )
+				),
+				'strlen'
+			)
+		)
+	);
+
+	$command = array(
+		$wp_binary,
+		'--path=' . $wp_root,
+	);
+
+	if ( $skip_themes ) {
+		$command[] = '--skip-themes';
+	}
+
+	if ( ! empty( $skip_plugins ) ) {
+		$command[] = '--skip-plugins=' . implode( ',', $skip_plugins );
+	}
+
+	$command[] = 'post';
+	$command[] = 'delete';
+	$command[] = (string) (int) $attachment_id;
+	$command[] = '--force';
+	$command[] = '--defer-term-counting';
+
+	$descriptorspec = array(
+		0 => array( 'pipe', 'r' ),
+		1 => array( 'pipe', 'w' ),
+		2 => array( 'pipe', 'w' ),
+	);
+
+	$process = proc_open(
+		$command,
+		$descriptorspec,
+		$pipes,
+		null,
+		null,
+		array( 'bypass_shell' => true )
+	);
+
+	if ( ! is_resource( $process ) ) {
+		return array(
+			'ok'        => false,
+			'transport' => 'wp-cli',
+			'stderr'    => 'Could not start the isolated WP-CLI attachment delete process.',
+		);
+	}
+
+	fclose( $pipes[0] );
+	$stdout = stream_get_contents( $pipes[1] );
+	fclose( $pipes[1] );
+	$stderr = stream_get_contents( $pipes[2] );
+	fclose( $pipes[2] );
+
+	$exit_code = proc_close( $process );
+
+	return array(
+		'ok'           => 0 === (int) $exit_code,
+		'transport'    => 'wp-cli',
+		'exit_code'    => (int) $exit_code,
+		'skip_plugins' => $skip_plugins,
+		'skip_themes'  => (bool) $skip_themes,
+		'stdout'       => old_posts_log_text_snippet( $stdout ),
+		'stderr'       => old_posts_log_text_snippet( $stderr ),
+	);
+}
+
+function old_posts_delete_attachment_with_mode( $attachment_id, $mode, $extra_skip_plugins = array(), $skip_themes = true ) {
+	if ( 'wp-cli' === $mode ) {
+		return old_posts_delete_attachment_via_wp_cli( $attachment_id, $extra_skip_plugins, $skip_themes );
+	}
+
+	$result = wp_delete_attachment( $attachment_id, true );
+
+	return array(
+		'ok'        => false !== $result && null !== $result,
+		'transport' => 'inline',
+	);
+}
+
 $cli_args = old_posts_collect_runtime_args(
 	isset( $args ) && is_array( $args ) ? $args : array(),
 	isset( $GLOBALS['argv'] ) && is_array( $GLOBALS['argv'] ) ? $GLOBALS['argv'] : array()
@@ -330,9 +755,41 @@ $dry_run       = old_posts_bool_arg( isset( $cli_args['dry-run'] ) ? $cli_args['
 $scan_postmeta = old_posts_bool_arg( isset( $cli_args['scan-postmeta'] ) ? $cli_args['scan-postmeta'] : null, false );
 $recheck_usage = old_posts_bool_arg( isset( $cli_args['recheck-usage'] ) ? $cli_args['recheck-usage'] : null, true );
 $limit_ignore_already_removed = old_posts_bool_arg( isset( $cli_args['limit-ignore-already-removed'] ) ? $cli_args['limit-ignore-already-removed'] : null, false );
+$attachment_delete_skip_plugins = old_posts_csv_arg(
+	isset( $cli_args['attachment-delete-skip-plugins'] )
+		? $cli_args['attachment-delete-skip-plugins']
+		: old_posts_env_string( 'OLD_POSTS_ATTACHMENT_DELETE_SKIP_PLUGINS', '' ),
+	array()
+);
+$attachment_delete_mode = isset( $cli_args['attachment-delete-mode'] )
+	? strtolower( trim( (string) $cli_args['attachment-delete-mode'] ) )
+	: strtolower( old_posts_env_string( 'OLD_POSTS_ATTACHMENT_DELETE_MODE', '' ) );
+if ( '' === $attachment_delete_mode && ! empty( $attachment_delete_skip_plugins ) ) {
+	$attachment_delete_mode = 'wp-cli';
+}
+if ( '' === $attachment_delete_mode ) {
+	$attachment_delete_mode = 'inline';
+}
+if ( ! in_array( $attachment_delete_mode, array( 'inline', 'wp-cli' ), true ) ) {
+	old_posts_fail(
+		'Invalid attachment delete mode.',
+		array(
+			'attachment_delete_mode' => $attachment_delete_mode,
+			'allowed_values'         => array( 'inline', 'wp-cli' ),
+		)
+	);
+}
+$attachment_delete_skip_themes = isset( $cli_args['attachment-delete-skip-themes'] )
+	? old_posts_bool_arg( $cli_args['attachment-delete-skip-themes'], true )
+	: (
+		'' !== old_posts_env_string( 'OLD_POSTS_ATTACHMENT_DELETE_SKIP_THEMES', '' )
+			? old_posts_bool_arg( old_posts_env_string( 'OLD_POSTS_ATTACHMENT_DELETE_SKIP_THEMES', '' ), true )
+			: old_posts_bool_arg( old_posts_env_string( 'OLD_POSTS_SKIP_THEMES', '' ), true )
+	);
 $progress_cfg  = old_posts_progress_config( $cli_args, 25, 30 );
 $log_path      = isset( $cli_args['log'] ) ? (string) $cli_args['log'] : old_posts_default_temp_path( 'old-posts-execution-log.jsonl' );
 $output_path   = isset( $cli_args['output'] ) ? (string) $cli_args['output'] : old_posts_default_temp_path( 'old-posts-redirects.csv' );
+$resume_log_args_present = ! empty( $cli_args['resume-log'] ) || ! empty( $cli_args['resume-log-glob'] );
 
 $manifest = old_posts_read_manifest( $manifest_path );
 
@@ -416,6 +873,52 @@ if ( 'export-redirects' === $phase ) {
 
 old_posts_assert_parent_writable( $log_path, 'JSONL log output' );
 
+$resume_log_paths = array();
+$resume_state     = array();
+if ( 'delete-attachments' === $phase && ! $dry_run && $resume_log_args_present ) {
+	$resume_log_paths = old_posts_resume_log_paths( $cli_args );
+	$resume_state     = old_posts_delete_attachments_resume_state( $resume_log_paths, $manifest_path, $year_filter );
+
+	if ( 0 === (int) $resume_state['matched_execution_count'] ) {
+		old_posts_log(
+			'warning',
+			'The provided resume logs did not contain a matching real delete-attachments execution for this manifest and year filter.',
+			array(
+				'resume_log_paths' => $resume_log_paths,
+				'manifest_path'    => $manifest_path,
+				'year_filter'      => $year_filter,
+			)
+		);
+	} else {
+		old_posts_log(
+			'info',
+			'Loaded prior delete-attachments logs for resume skipping.',
+			array(
+				'resume_log_paths'       => $resume_state['matched_log_paths'],
+				'matched_executions'     => (int) $resume_state['matched_execution_count'],
+				'skip_candidates'        => (int) $resume_state['skip_candidate_count'],
+				'incomplete_group_roots' => count( $resume_state['incomplete_group_roots'] ),
+			)
+		);
+	}
+} elseif ( 'delete-attachments' !== $phase && $resume_log_args_present ) {
+	old_posts_log(
+		'warning',
+		'resume-log and resume-log-glob are only used by phase=delete-attachments. They will be ignored.',
+		array(
+			'phase' => $phase,
+		)
+	);
+} elseif ( 'delete-attachments' === $phase && $dry_run && $resume_log_args_present ) {
+	old_posts_log(
+		'warning',
+		'resume-log and resume-log-glob are ignored during dry-run execution.',
+		array(
+			'phase' => $phase,
+		)
+	);
+}
+
 $candidate_post_ids = array();
 $post_records       = array();
 foreach ( $manifest['posts'] as $post_record ) {
@@ -476,25 +979,49 @@ if ( '' !== $log_path && file_exists( $log_path ) ) {
 
 old_posts_append_jsonl(
 	$log_path,
-	array(
-		'timestamp'      => gmdate( 'c' ),
-		'phase'          => $phase,
-		'action'         => 'start_execution',
-		'status'         => 'started',
-		'dry_run'        => $dry_run,
-		'year_filter'    => $year_filter,
-		'batch_size'     => $batch_size,
-		'limit'          => $limit,
-		'post_records'   => count( $post_records ),
-		'attachments'    => count( $attachment_records ),
-		'recheck_usage'  => $recheck_usage,
-		'duplicate_args' => $duplicate_cli_args,
-		'limit_ignore_already_removed' => $limit_ignore_already_removed,
-		'progress_every' => $progress_cfg['every'],
-		'progress_seconds' => $progress_cfg['seconds'],
-		'manifest_path'  => $manifest_path,
+	array_merge(
+		array(
+			'timestamp'      => gmdate( 'c' ),
+			'phase'          => $phase,
+			'action'         => 'start_execution',
+			'status'         => 'started',
+			'dry_run'        => $dry_run,
+			'year_filter'    => $year_filter,
+			'batch_size'     => $batch_size,
+			'limit'          => $limit,
+			'post_records'   => count( $post_records ),
+			'attachments'    => count( $attachment_records ),
+			'recheck_usage'  => $recheck_usage,
+			'duplicate_args' => $duplicate_cli_args,
+			'limit_ignore_already_removed' => $limit_ignore_already_removed,
+			'attachment_delete_mode' => $attachment_delete_mode,
+			'attachment_delete_skip_plugins' => $attachment_delete_skip_plugins,
+			'attachment_delete_skip_themes' => $attachment_delete_skip_themes,
+			'progress_every' => $progress_cfg['every'],
+			'progress_seconds' => $progress_cfg['seconds'],
+			'manifest_path'  => $manifest_path,
+		),
+		! empty( $resume_log_paths )
+			? array(
+				'resume_log_paths'         => $resume_log_paths,
+				'resume_matched_executions' => (int) ( $resume_state['matched_execution_count'] ?? 0 ),
+				'resume_skip_candidates'   => (int) ( $resume_state['skip_candidate_count'] ?? 0 ),
+			)
+			: array()
 	)
 );
+
+if ( 'delete-attachments' === $phase && ! $dry_run && 'wp-cli' === $attachment_delete_mode ) {
+	old_posts_log(
+		'warning',
+		'Attachment deletes will run in isolated WP-CLI subprocesses. This is slower, but one plugin fatal will not abort the whole batch.',
+		array(
+			'attachment_delete_mode' => $attachment_delete_mode,
+			'attachment_delete_skip_plugins' => $attachment_delete_skip_plugins,
+			'attachment_delete_skip_themes' => $attachment_delete_skip_themes,
+		)
+	);
+}
 
 if ( 'trash-posts' === $phase || 'force-delete-posts' === $phase ) {
 	$stop_processing = false;
@@ -749,7 +1276,54 @@ if ( 'delete-attachments' === $phase ) {
 			}
 
 			$attachment_progress_index = $attachment_records_processed + 1;
-			$attachment_id          = (int) $attachment_record['attachment_id'];
+			$attachment_id             = (int) $attachment_record['attachment_id'];
+			$resume_skip               = old_posts_delete_attachments_resume_skip( $attachment_id, $resume_state, $limit_ignore_already_removed );
+			if ( is_array( $resume_skip ) ) {
+				old_posts_log(
+					'info',
+					'Attachment was already settled by a previous matching delete-attachments log. Skipping expensive rechecks.',
+					array(
+						'attachment_id'   => $attachment_id,
+						'resume_reason'   => $resume_skip['reason'],
+						'resume_log_path' => $resume_skip['resume_log_path'],
+					)
+				);
+				old_posts_append_jsonl(
+					$log_path,
+					array(
+						'timestamp'       => gmdate( 'c' ),
+						'phase'           => $phase,
+						'action'          => 'resume_skip_attachment',
+						'status'          => 'skipped_from_resume_log',
+						'attachment_id'   => $attachment_id,
+						'dry_run'         => $dry_run,
+						'resume_reason'   => $resume_skip['reason'],
+						'resume_log_path' => $resume_skip['resume_log_path'],
+					)
+				);
+				old_posts_increment_counters( $processed, $limit_counter, $resume_skip['count_toward_limit'] );
+				$attachment_records_processed = $attachment_progress_index;
+				old_posts_progress_maybe_log(
+					$progress_state,
+					'Execution progress.',
+					$limit > 0 ? $limit_counter : $attachment_records_processed,
+					$progress_goal,
+					array(
+						'processed_records' => $attachment_records_processed,
+						'total_records'     => $total_records,
+						'processed_attachments' => $processed,
+						'phase'             => $phase,
+						'failures'          => $failures,
+					),
+					array(
+						'phase'    => $phase,
+						'log_path' => $log_path,
+						'action'   => 'progress_checkpoint',
+					)
+				);
+				continue;
+			}
+
 			$attachment             = get_post( $attachment_id );
 			$root_exists            = $attachment instanceof WP_Post;
 			$skip_group_recheck_ids = array();
@@ -1004,9 +1578,17 @@ if ( 'delete-attachments' === $phase ) {
 			foreach ( $group_plan['delete_records'] as $delete_attachment_id => $delete_attachment_record ) {
 				$processed_object_ids[] = (int) $delete_attachment_id;
 				$status = 'dry-run';
+				$delete_result = array(
+					'transport' => $attachment_delete_mode,
+				);
 				if ( ! $dry_run ) {
-					$result = wp_delete_attachment( $delete_attachment_id, true );
-					if ( false === $result || null === $result ) {
+					$delete_result = old_posts_delete_attachment_with_mode(
+						$delete_attachment_id,
+						$attachment_delete_mode,
+						$attachment_delete_skip_plugins,
+						$attachment_delete_skip_themes
+					);
+					if ( empty( $delete_result['ok'] ) ) {
 						$status = 'failed';
 						++$failures;
 					} else {
@@ -1030,6 +1612,13 @@ if ( 'delete-attachments' === $phase ) {
 						'deletion_scope'          => $group_plan['group_delete_enabled'] ? 'wpml_file_group' : 'single_attachment',
 						'shared_file_group_size'  => count( $group_plan['delete_records'] ),
 						'root_exists'             => $root_exists,
+						'attachment_delete_mode'  => $attachment_delete_mode,
+						'attachment_delete_transport' => $delete_result['transport'] ?? $attachment_delete_mode,
+						'attachment_delete_skip_plugins' => 'wp-cli' === $attachment_delete_mode ? $attachment_delete_skip_plugins : array(),
+						'attachment_delete_skip_themes' => 'wp-cli' === $attachment_delete_mode ? $attachment_delete_skip_themes : null,
+						'attachment_delete_exit_code' => isset( $delete_result['exit_code'] ) ? (int) $delete_result['exit_code'] : null,
+						'attachment_delete_stdout' => ! empty( $delete_result['stdout'] ) ? $delete_result['stdout'] : null,
+						'attachment_delete_stderr' => ! empty( $delete_result['stderr'] ) ? $delete_result['stderr'] : null,
 					)
 				);
 
@@ -1038,9 +1627,17 @@ if ( 'delete-attachments' === $phase ) {
 					'group_root_attachment_id' => $attachment_id,
 					'deletion_scope'          => $group_plan['group_delete_enabled'] ? 'wpml_file_group' : 'single_attachment',
 					'shared_file_group_size'  => count( $group_plan['delete_records'] ),
+					'attachment_delete_mode'  => $attachment_delete_mode,
+					'attachment_delete_transport' => $delete_result['transport'] ?? $attachment_delete_mode,
 				);
 				if ( ! empty( $delete_attachment_record['file'] ) ) {
 					$delete_log_context['file'] = (string) $delete_attachment_record['file'];
+				}
+				if ( isset( $delete_result['exit_code'] ) ) {
+					$delete_log_context['attachment_delete_exit_code'] = (int) $delete_result['exit_code'];
+				}
+				if ( ! empty( $delete_result['stderr'] ) ) {
+					$delete_log_context['attachment_delete_stderr'] = $delete_result['stderr'];
 				}
 
 				if ( 'failed' === $status ) {

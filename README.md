@@ -206,6 +206,7 @@ Key protections:
 - confirmation tokens for destructive real runs
 - manifest fingerprint check for posts
 - optional external usage recheck for attachments
+- `delete-attachments` can reuse one or more prior JSONL logs through `resume-log=...`
 - runtime cache cleanup between destructive batches to keep long WP-CLI runs stable
 - JSONL logs for resumable operations
 
@@ -256,7 +257,7 @@ Purpose:
 - Take fresh database and uploads backups before every destructive batch, not only before the first test run.
 - Preserve `OLD_POSTS_OUTPUT_DIR` together with your infrastructure backups so the manifest and logs stay available for audit and rollback analysis.
 - Use `nohup` for long audits and destructive runs.
-- Use fresh log files for reruns whenever possible.
+- Use fresh log files for reruns whenever possible, then pass the older `delete-attachments` logs back through `resume-log=` when you want to skip work that already finished.
 - Validate the site between phases, not only at the end.
 - Treat leftovers reports as review artifacts, not as auto-delete commands.
 - If you change the deletion criteria, generate a new manifest.

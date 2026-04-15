@@ -296,6 +296,34 @@ done
 ' >"$OLD_POSTS_OUTPUT_DIR/delete-attachments-batch.out" 2>&1 &
 ```
 
+### Fast rerun after an interrupted year
+
+Use a fresh output log for the new attempt, and pass one or more older JSONL logs in `resume-log=`. The script reads all matching `delete-attachments` executions from those logs, merges the attachments already settled across all of them, and skips only the terminal cases before the expensive rechecks begin.
+
+```bash
+nohup sh -c '
+./run_wp_old_posts.sh eval-file wp_old_posts_execute.php \
+  manifest="$MANIFEST_PATH" \
+  phase=delete-attachments \
+  year="$YEAR" \
+  batch-size="$OLD_POSTS_ATTACHMENT_BATCH_SIZE" \
+  dry-run=0 \
+  recheck-usage="$OLD_POSTS_RECHECK_USAGE" \
+  log="$OLD_POSTS_OUTPUT_DIR/delete-attachments-$YEAR-rerun3.jsonl" \
+  resume-log="$OLD_POSTS_OUTPUT_DIR/delete-attachments-$YEAR.jsonl,$OLD_POSTS_OUTPUT_DIR/delete-attachments-$YEAR-rerun2.jsonl" \
+  progress-every="$OLD_POSTS_PROGRESS_EVERY" \
+  progress-seconds="$OLD_POSTS_PROGRESS_SECONDS" \
+  confirm=CONFIRM-XXXXXXXX
+' >"$OLD_POSTS_OUTPUT_DIR/delete-attachments-$YEAR-rerun3.out" 2>&1 &
+```
+
+Notes:
+
+- `resume-log=` accepts a comma-separated list of JSONL files.
+- `resume-log-glob=` is also available when that is easier than listing each file manually.
+- Only real `delete-attachments` executions with the same manifest path and `year=` are considered.
+- Entries like `external_usage_detected` and shared-file retention are intentionally rechecked; only terminal outcomes are skipped automatically.
+
 Validation checklist:
 
 - The JSONL log shows `delete_attachment` and `progress_checkpoint` entries.
@@ -491,7 +519,7 @@ This is expected. The script is protecting the phase. Copy the token from the er
 
 ### A rerun shows many `already_removed` entries
 
-That is normal after interrupted or repeated runs. Use a new JSONL log for reruns so the log remains easier to inspect.
+That is normal after interrupted or repeated runs. Use a new JSONL log for reruns so the log remains easier to inspect, and pass the older logs through `resume-log=` if you want the next `delete-attachments` run to skip terminal attachments sooner.
 
 ### The leftovers selection step is slow
 
