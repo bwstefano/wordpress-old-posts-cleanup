@@ -388,6 +388,45 @@ nohup sh -c '
 ' >"$OLD_POSTS_OUTPUT_DIR/wpml-consistency-$YEAR-apply.out" 2>&1 &
 ```
 
+### Batch apply across multiple years
+
+The confirmation token is different for each year because it is derived from the manifest path and the exact log list. This batch command computes the expected token for each year before running the repair. It includes every `delete-attachments` log that exists for the year, including reruns, and also includes the force-delete log when that file already exists.
+
+```bash
+nohup sh -c '
+echo "YEAR_LIST=$YEAR_LIST"
+for year in $YEAR_LIST; do
+  echo "=== $(date) | wpml-consistency apply year=$year ==="
+  logs=""
+  for log_path in "$OLD_POSTS_OUTPUT_DIR/delete-attachments-$year".jsonl "$OLD_POSTS_OUTPUT_DIR/delete-attachments-$year"-*.jsonl; do
+    [ -f "$log_path" ] || continue
+    if [ -z "$logs" ]; then
+      logs="$log_path"
+    else
+      logs="$logs,$log_path"
+    fi
+  done
+  if [ -z "$logs" ]; then
+    echo "No delete-attachments logs found for year=$year; skipping."
+    continue
+  fi
+  force_log="$OLD_POSTS_OUTPUT_DIR/force-delete-$year.jsonl"
+  if [ -f "$force_log" ]; then
+    logs="$logs,$force_log"
+  fi
+  echo "logs=$logs"
+  confirm="$(php -r "echo \"CONFIRM-\" . strtoupper(substr(sha1(\$argv[1]), 0, 8));" "$MANIFEST_PATH|$logs|wpml-consistency-repair")"
+  ./run_wp_old_posts.sh eval-file wp_old_posts_wpml_consistency.php \
+    manifest="$MANIFEST_PATH" \
+    log="$logs" \
+    output="$OLD_POSTS_OUTPUT_DIR/wpml-consistency-$year.json" \
+    jsonl="$OLD_POSTS_OUTPUT_DIR/wpml-consistency-$year.jsonl" \
+    apply=1 \
+    confirm="$confirm" || break
+done
+' >"$OLD_POSTS_OUTPUT_DIR/wpml-consistency-batch-apply.out" 2>&1 &
+```
+
 What this script does when WPML is available:
 
 - inspects affected `trid` groups after destructive phases
@@ -403,7 +442,7 @@ nohup sh -c '
 ./run_wp_old_posts.sh eval-file wp_old_posts_attachment_leftovers.php \
   manifest="$MANIFEST_PATH" \
   year="$YEAR" \
-  log="$ATTACH_LOG" \
+  log-glob="$OLD_POSTS_OUTPUT_DIR/delete-attachments-$YEAR*.jsonl" \
   output="$LEFTOVERS_REPORT"
 ' >"$OLD_POSTS_OUTPUT_DIR/leftovers-$YEAR.out" 2>&1 &
 ```
@@ -412,12 +451,27 @@ nohup sh -c '
 
 ```bash
 nohup sh -c '
+echo "YEAR_LIST=$YEAR_LIST"
 for year in $YEAR_LIST; do
   echo "=== $(date) | attachment-leftovers year=$year ==="
+  logs=""
+  for log_path in "$OLD_POSTS_OUTPUT_DIR/delete-attachments-$year".jsonl "$OLD_POSTS_OUTPUT_DIR/delete-attachments-$year"-*.jsonl; do
+    [ -f "$log_path" ] || continue
+    if [ -z "$logs" ]; then
+      logs="$log_path"
+    else
+      logs="$logs,$log_path"
+    fi
+  done
+  if [ -z "$logs" ]; then
+    echo "No delete-attachments logs found for year=$year; skipping."
+    continue
+  fi
+  echo "logs=$logs"
   ./run_wp_old_posts.sh eval-file wp_old_posts_attachment_leftovers.php \
     manifest="$MANIFEST_PATH" \
     year="$year" \
-    log="$OLD_POSTS_OUTPUT_DIR/delete-attachments-$year.jsonl" \
+    log="$logs" \
     output="$OLD_POSTS_OUTPUT_DIR/leftovers-$year.json" || break
 done
 ' >"$OLD_POSTS_OUTPUT_DIR/leftovers-batch.out" 2>&1 &
@@ -438,6 +492,26 @@ nohup sh -c '
 ' >"$OLD_POSTS_OUTPUT_DIR/leftovers-selection-$YEAR.out" 2>&1 &
 ```
 
+### Batch selection generation
+
+```bash
+nohup sh -c '
+echo "YEAR_LIST=$YEAR_LIST"
+for year in $YEAR_LIST; do
+  echo "=== $(date) | leftovers-selection year=$year ==="
+  report="$OLD_POSTS_OUTPUT_DIR/leftovers-$year.json"
+  selection="$OLD_POSTS_OUTPUT_DIR/leftovers-approved-$year.txt"
+  if [ ! -f "$report" ]; then
+    echo "Leftovers report not found for year=$year; skipping."
+    continue
+  fi
+  ./run_wp_old_posts.sh eval-file wp_old_posts_leftovers_selection.php \
+    report="$report" \
+    output="$selection" || break
+done
+' >"$OLD_POSTS_OUTPUT_DIR/leftovers-selection-batch.out" 2>&1 &
+```
+
 Review the generated file manually before deleting anything from disk.
 
 ## 12. Delete approved leftovers
@@ -452,6 +526,33 @@ Review the generated file manually before deleting anything from disk.
   log="$LEFTOVERS_DELETE_LOG"
 ```
 
+### Batch dry-run
+
+```bash
+nohup sh -c '
+echo "YEAR_LIST=$YEAR_LIST"
+for year in $YEAR_LIST; do
+  echo "=== $(date) | leftovers-delete dry-run year=$year ==="
+  report="$OLD_POSTS_OUTPUT_DIR/leftovers-$year.json"
+  selection="$OLD_POSTS_OUTPUT_DIR/leftovers-approved-$year.txt"
+  log="$OLD_POSTS_OUTPUT_DIR/leftovers-delete-$year-dry-run.jsonl"
+  if [ ! -f "$report" ]; then
+    echo "Leftovers report not found for year=$year; skipping."
+    continue
+  fi
+  if [ ! -s "$selection" ]; then
+    echo "Leftovers selection missing or empty for year=$year; skipping."
+    continue
+  fi
+  ./run_wp_old_posts.sh eval-file wp_old_posts_leftovers_delete.php \
+    report="$report" \
+    selection="$selection" \
+    dry-run=1 \
+    log="$log" || break
+done
+' >"$OLD_POSTS_OUTPUT_DIR/leftovers-delete-batch-dry-run.out" 2>&1 &
+```
+
 ### Real run
 
 ```bash
@@ -463,6 +564,37 @@ nohup sh -c '
   log="$LEFTOVERS_DELETE_LOG" \
   confirm=CONFIRM-XXXXXXXX
 ' >"$OLD_POSTS_OUTPUT_DIR/leftovers-delete-$YEAR.out" 2>&1 &
+```
+
+### Batch real run
+
+Run this only after reviewing the batch dry-run output and the generated selection files.
+
+```bash
+nohup sh -c '
+echo "YEAR_LIST=$YEAR_LIST"
+for year in $YEAR_LIST; do
+  echo "=== $(date) | leftovers-delete real year=$year ==="
+  report="$OLD_POSTS_OUTPUT_DIR/leftovers-$year.json"
+  selection="$OLD_POSTS_OUTPUT_DIR/leftovers-approved-$year.txt"
+  log="$OLD_POSTS_OUTPUT_DIR/leftovers-delete-$year.jsonl"
+  if [ ! -f "$report" ]; then
+    echo "Leftovers report not found for year=$year; skipping."
+    continue
+  fi
+  if [ ! -s "$selection" ]; then
+    echo "Leftovers selection missing or empty for year=$year; skipping."
+    continue
+  fi
+  confirm="$(php -r "echo \"CONFIRM-\" . strtoupper(substr(sha1(\$argv[1] . \"|delete-leftovers\"), 0, 8));" "$report")"
+  ./run_wp_old_posts.sh eval-file wp_old_posts_leftovers_delete.php \
+    report="$report" \
+    selection="$selection" \
+    dry-run=0 \
+    log="$log" \
+    confirm="$confirm" || break
+done
+' >"$OLD_POSTS_OUTPUT_DIR/leftovers-delete-batch.out" 2>&1 &
 ```
 
 Important safeguards:
@@ -486,6 +618,24 @@ Run this only after attachment cleanup and validation are complete for the same 
   dry-run=1
 ```
 
+### Batch dry-run
+
+```bash
+nohup sh -c '
+echo "YEAR_LIST=$YEAR_LIST"
+for year in $YEAR_LIST; do
+  echo "=== $(date) | force-delete-posts dry-run year=$year ==="
+  ./run_wp_old_posts.sh eval-file wp_old_posts_execute.php \
+    manifest="$MANIFEST_PATH" \
+    phase=force-delete-posts \
+    year="$year" \
+    batch-size="$OLD_POSTS_POST_BATCH_SIZE" \
+    dry-run=1 \
+    log="$OLD_POSTS_OUTPUT_DIR/force-delete-$year-dry-run.jsonl" || break
+done
+' >"$OLD_POSTS_OUTPUT_DIR/force-delete-batch-dry-run.out" 2>&1 &
+```
+
 ### Real run
 
 ```bash
@@ -499,6 +649,28 @@ nohup sh -c '
   log="$FORCE_DELETE_LOG" \
   confirm=CONFIRM-XXXXXXXX
 ' >"$OLD_POSTS_OUTPUT_DIR/force-delete-$YEAR.out" 2>&1 &
+```
+
+### Batch real run
+
+Run this only after reviewing the batch dry-run output.
+
+```bash
+nohup sh -c '
+echo "YEAR_LIST=$YEAR_LIST"
+confirm="$(php -r "\$m=json_decode(file_get_contents(\$argv[1]), true); echo \"CONFIRM-\" . strtoupper(substr(sha1(\$m[\"generated_at\"] . \"|\" . \$m[\"site\"][\"home_url\"] . \"|force-delete-posts\"), 0, 8));" "$MANIFEST_PATH")"
+for year in $YEAR_LIST; do
+  echo "=== $(date) | force-delete-posts real year=$year ==="
+  ./run_wp_old_posts.sh eval-file wp_old_posts_execute.php \
+    manifest="$MANIFEST_PATH" \
+    phase=force-delete-posts \
+    year="$year" \
+    batch-size="$OLD_POSTS_POST_BATCH_SIZE" \
+    dry-run=0 \
+    log="$OLD_POSTS_OUTPUT_DIR/force-delete-$year.jsonl" \
+    confirm="$confirm" || break
+done
+' >"$OLD_POSTS_OUTPUT_DIR/force-delete-batch.out" 2>&1 &
 ```
 
 ## 14. Final validation
