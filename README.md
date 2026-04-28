@@ -9,6 +9,7 @@ The toolkit is meant for operators who want more than a one-off SQL script:
 - redirect export support
 - media usage checks before attachment deletion
 - filesystem leftovers reporting and controlled cleanup
+- orphan `post_tag` relationship cleanup after force-deleting posts
 - optional WPML translation consistency checks after destructive phases
 
 ## What the toolkit does
@@ -23,7 +24,8 @@ At a high level, the workflow is:
 6. Audit leftovers on disk and build a reviewed deletion list.
 7. Delete approved leftovers from disk.
 8. Force-delete the posts after validation.
-9. Optionally verify and repair WPML translation consistency.
+9. Clean orphan `post_tag` relationships and recount tag counts.
+10. Optionally verify and repair WPML translation consistency.
 
 ## Safety model
 
@@ -34,6 +36,7 @@ The scripts are designed around guardrails instead of raw speed:
 - attachments are not deleted when external usage is detected
 - leftovers deletion is restricted to files present in the leftovers report
 - leftovers deletion rechecks live attachment references before each `unlink()`
+- orphan tag cleanup is hard-limited to `post_tag` relationships whose `object_id` no longer exists in `wp_posts`
 - WPML-specific repair logic runs only when WPML is available and the group is unambiguous
 
 ## Repository layout
@@ -46,6 +49,8 @@ The scripts are designed around guardrails instead of raw speed:
   Builds the manifest of candidate posts and candidate attachments.
 - `wp_old_posts_execute.php`
   Runs the main phases: `export-redirects`, `trash-posts`, `delete-attachments`, and `force-delete-posts`.
+- `wp_old_posts_orphan_tag_relationships.php`
+  Reports and optionally removes orphan `post_tag` rows from `wp_term_relationships`, then recounts `post_tag` terms after a real cleanup.
 - `wp_old_posts_remaining_posts.php`
   Reports the posts that remained live in the target years after `trash-posts`, with review reasons and an optional CSV for manual triage.
 - `wp_old_posts_attachment_leftovers.php`
@@ -82,9 +87,9 @@ At minimum, back up:
 
 Why these backups matter:
 
-- The database backup is the rollback path for post deletion, attachment deletion, post meta changes, redirect export inputs, and any side effects triggered by WordPress hooks during deletion.
+- The database backup is the rollback path for post deletion, attachment deletion, orphan tag relationship cleanup, post meta changes, redirect export inputs, and any side effects triggered by WordPress hooks during deletion.
 - The uploads backup is the rollback path for real attachment deletion and approved leftovers deletion. Even when you are operating year by year, shared attachment files can be referenced by more than one post or translation group, so a narrow per-year filesystem backup is usually a poor substitute for a full uploads backup.
-- The operation-artifact backup preserves the manifest, JSONL logs, leftovers reports, reviewed selection files, and WPML consistency reports that explain what happened during each phase.
+- The operation-artifact backup preserves the manifest, JSONL logs, leftovers reports, orphan tag relationship reports, reviewed selection files, and WPML consistency reports that explain what happened during each phase.
 
 If WPML is active, treat the database backup as mandatory, not optional. Translation-group consistency is repairable in many cases, but only a database backup gives you a reliable full rollback.
 
@@ -252,6 +257,22 @@ Purpose:
 - report orphan translation rows and inconsistent originals
 - optionally apply conservative repairs
 
+### 8. `wp_old_posts_orphan_tag_relationships.php`
+
+Purpose:
+
+- report orphan `post_tag` relationships left behind after posts have been force-deleted
+- group the report by `term_id`, `term_taxonomy_id`, tag `name`, `slug`, stored count, orphan relationship count, and orphan object IDs
+- delete only `wp_term_relationships` rows where the joined taxonomy is `post_tag` and the related `object_id` is missing from `wp_posts`
+- recount all `post_tag` terms after a real cleanup
+
+Key protections:
+
+- dry-run by default
+- confirmation token required for `dry-run=0`
+- report and JSONL log paths default under `OLD_POSTS_OUTPUT_DIR`
+- no option exists to target other taxonomies
+
 ## Operational guidance
 
 - Take fresh database and uploads backups before every destructive batch, not only before the first test run.
@@ -260,6 +281,7 @@ Purpose:
 - Use fresh log files for reruns whenever possible, then pass the older `delete-attachments` logs back through `resume-log=` when you want to skip work that already finished.
 - Validate the site between phases, not only at the end.
 - Treat leftovers reports as review artifacts, not as auto-delete commands.
+- Run the orphan tag relationship cleanup after the final `force-delete-posts` run for the cleanup scope, especially when tag counts look inflated after old posts are gone.
 - If you change the deletion criteria, generate a new manifest.
 
 For the step-by-step commands, use `RUNBOOK.md`.

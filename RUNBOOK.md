@@ -20,7 +20,7 @@ The wrapper script reads `old-posts.env`, adds `--path="$OLD_POSTS_WP_ROOT"`, ap
 
 ## 2. Backup before any destructive phase
 
-Before you run `trash-posts`, `delete-attachments`, `delete-leftovers`, `force-delete-posts`, or WPML repair with `apply=1`, capture fresh backups of the installation components that this toolkit can change.
+Before you run `trash-posts`, `delete-attachments`, `delete-leftovers`, `force-delete-posts`, orphan tag relationship cleanup with `dry-run=0`, or WPML repair with `apply=1`, capture fresh backups of the installation components that this toolkit can change.
 
 Minimum backup set:
 
@@ -32,7 +32,7 @@ Why this is the minimum:
 
 - WordPress deletion routines touch more than one table. Even if your target is "old posts", WordPress can update post rows, post meta, taxonomy relationships, comments-related data, and plugin-owned data through hooks.
 - Attachment cleanup and leftovers deletion act on the filesystem. If a file is removed by mistake, the uploads backup is your rollback path.
-- The output directory contains the manifest, JSONL logs, leftovers reports, reviewed selections, redirect CSVs, and optional WPML reports that explain what the toolkit did.
+- The output directory contains the manifest, JSONL logs, leftovers reports, orphan tag relationship reports, reviewed selections, redirect CSVs, and optional WPML reports that explain what the toolkit did.
 
 If WPML is active, treat the database backup as mandatory before every destructive batch. The toolkit can repair many translation-group inconsistencies conservatively, but a repair script is not a substitute for a real rollback.
 
@@ -64,6 +64,8 @@ export LEFTOVERS_REPORT="$OLD_POSTS_OUTPUT_DIR/leftovers-$YEAR.json"
 export LEFTOVERS_SELECTION="$OLD_POSTS_OUTPUT_DIR/leftovers-approved-$YEAR.txt"
 export LEFTOVERS_DELETE_LOG="$OLD_POSTS_OUTPUT_DIR/leftovers-delete-$YEAR.jsonl"
 export FORCE_DELETE_LOG="$OLD_POSTS_OUTPUT_DIR/force-delete-$YEAR.jsonl"
+export ORPHAN_TAG_REPORT="$OLD_POSTS_OUTPUT_DIR/orphan-tag-relationships-before.json"
+export ORPHAN_TAG_LOG="$OLD_POSTS_OUTPUT_DIR/orphan-tag-relationships.jsonl"
 export WPML_REPORT="$OLD_POSTS_OUTPUT_DIR/wpml-consistency-$YEAR.json"
 export WPML_JSONL="$OLD_POSTS_OUTPUT_DIR/wpml-consistency-$YEAR.jsonl"
 ```
@@ -673,17 +675,81 @@ done
 ' >"$OLD_POSTS_OUTPUT_DIR/force-delete-batch.out" 2>&1 &
 ```
 
-## 14. Final validation
+## 14. Clean orphan tag relationships
+
+Run this after the relevant `force-delete-posts` runs are complete. It is a database-only cleanup for cases where deleted posts are gone from `wp_posts`, but their old tag links are still present in `wp_term_relationships`, causing inflated `post_tag` counts.
+
+This step is global, not year-scoped. Run it once after the final force-delete batch for the cleanup scope, or rerun the dry-run report whenever you need to confirm the current state.
+
+Before the real run, take a fresh database backup. The real run deletes rows and then recounts `post_tag` terms.
+
+### Dry-run
+
+```bash
+./run_wp_old_posts.sh eval-file wp_old_posts_orphan_tag_relationships.php \
+  output="$ORPHAN_TAG_REPORT" \
+  log="$ORPHAN_TAG_LOG" \
+  dry-run=1
+```
+
+Review the JSON report before deleting anything. Each item is grouped by:
+
+- `term_id`
+- `term_taxonomy_id`
+- `name`
+- `slug`
+- `stored_count`
+- `orphan_relationships`
+- `orphan_object_ids`
+
+The script only considers relationships where the joined taxonomy is exactly `post_tag` and the `object_id` does not exist in `wp_posts`. It has no option to target categories, custom taxonomies, or any other relationship rows.
+
+Internally, the destructive query is the guarded `$wpdb` equivalent of deleting from `term_relationships` joined to `term_taxonomy` for `taxonomy = 'post_tag'` with a missing joined post row, using the live table prefix from WordPress.
+
+### Real run
+
+Run the real command once without `confirm=` if you need the script to print the expected token after writing the review report. Then rerun with that token.
+
+```bash
+nohup sh -c '
+./run_wp_old_posts.sh eval-file wp_old_posts_orphan_tag_relationships.php \
+  output="$ORPHAN_TAG_REPORT" \
+  log="$ORPHAN_TAG_LOG" \
+  dry-run=0 \
+  confirm=CONFIRM-XXXXXXXX
+' >"$OLD_POSTS_OUTPUT_DIR/orphan-tag-relationships.out" 2>&1 &
+```
+
+What the real run does:
+
+- writes the before-cleanup report to `"$ORPHAN_TAG_REPORT"`
+- deletes only orphan `post_tag` rows from `wp_term_relationships`
+- runs the WordPress term recount for all `post_tag` terms
+- writes start, report, delete, recount, and finish events to `"$ORPHAN_TAG_LOG"`
+
+### Verify after cleanup
+
+```bash
+./run_wp_old_posts.sh eval-file wp_old_posts_orphan_tag_relationships.php \
+  output="$OLD_POSTS_OUTPUT_DIR/orphan-tag-relationships-after.json" \
+  log="$OLD_POSTS_OUTPUT_DIR/orphan-tag-relationships-after.jsonl" \
+  dry-run=1
+```
+
+The after-cleanup report should show `summary.orphan_relationships` as `0`.
+
+## 15. Final validation
 
 Repeat this checklist before moving to the next year:
 
 - review the phase log(s)
 - review the leftovers report and leftovers delete log when applicable
 - confirm that expected posts are gone from the trash after `force-delete-posts`
+- confirm the orphan tag after-cleanup report is empty when you ran that cleanup
 - run the optional WPML consistency step after the final destructive phase for that year
 - perform spot checks on the frontend and in the media library
 
-## 15. Troubleshooting
+## 16. Troubleshooting
 
 ### A destructive command asks for `CONFIRM-...`
 
